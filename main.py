@@ -278,44 +278,40 @@ def collect_media_files(source_dir: Path, show_progress: bool = True) -> tuple[L
 
 
 def generate_target_path(
-    media_file: MediaFile, destination: Path, year: Optional[int] = None
+    media_file: MediaFile, destination: Path, year: Optional[int] = None, iphone_mode: bool = False
 ) -> Path:
     """
-    Generate target path for media file based on year.
+    Generate target path for media file based on year and iPhone Mode.
+    
+    Проверка на 2004 год и уход от использования текущей даты.
     
     Краткое описание: Генерирует целевой путь для медиафайла на основе года,
     извлеченного из метаданных с использованием стратегии выбора самой ранней даты.
-    Если год не найден, используется папка "Unknown_Year" вместо текущего года.
+    Если iPhone Mode включен, сортирует только файлы с Apple устройств по годам.
+    Если год не найден (extracted date is None), используется папка "Unknown_Year"
+    вместо текущего года. Это гарантирует, что файлы с нулевыми метаданными
+    группируются отдельно для ручной проверки, вместо смешивания с файлами 2026 года.
+    Принудительное использование папки Unknown_Year для файлов без метаданных.
 
     Args:
         media_file: MediaFile instance
         destination: Destination root directory
         year: Year for sorting (extracted from metadata if not provided)
+        iphone_mode: If True, only Apple devices are sorted by year
 
     Returns:
         Target path
     """
-    # Извлечение года из метаданных, если не указан явно
-    if not year:
-        best_dt = media_file.get_earliest_timestamp()  # Использует новую логику с фильтрацией 2004 года
-        if best_dt:
-            year = best_dt.year
-        else:
-            # Fallback на "Unknown_Year" вместо текущего года
-            year = "Unknown_Year"
-
-    # Формирование пути: destination/год/имя_файла
-    target_dir = destination / str(year)
-    target_path = target_dir / media_file.source_path.name
-
-    return target_path
+    from utils.file_handler import get_target_path as get_target_path_handler
+    return get_target_path_handler(media_file, destination, iphone_mode)
 
 
 def sort_media_files(
     source_dir: Path, 
     destination_dir: Path, 
     verify_location: bool = True,
-    show_progress: bool = True
+    show_progress: bool = True,
+    iphone_mode: bool = False
 ) -> dict:
     """
     Sort media files from source to destination by year (synchronous processing).
@@ -337,7 +333,7 @@ def sort_media_files(
     logger.info(f"Начало сортировки медиафайлов: {source_dir} -> {destination_dir}")
 
     # Сбор всех медиафайлов из исходной директории
-    media_files = collect_media_files(source_dir, show_progress=show_progress)
+    media_files, total_count, total_size = collect_media_files(source_dir, show_progress=show_progress)
     logger.info(f"Найдено {len(media_files)} медиафайлов")
 
     # Инициализация статистики
@@ -346,6 +342,8 @@ def sort_media_files(
         'moved': 0,
         'failed': 0,
         'skipped': 0,
+        'unknown_year_count': 0,  # Счетчик файлов, перемещенных в Unknown_Year
+        'non_iphone_count': 0,  # Счетчик файлов не с Apple устройств (только для iPhone Mode)
     }
     
     moved_files = []
@@ -364,14 +362,25 @@ def sort_media_files(
                 else:
                     safe_print(progress_msg)
 
-            # Генерация целевого пути на основе года
-            target_path = generate_target_path(media_file, destination_dir)
+            # Генерация целевого пути на основе года и iPhone Mode
+            target_path = generate_target_path(media_file, destination_dir, iphone_mode=iphone_mode)
             media_file.target_path = target_path
 
             # СИНХРОННОЕ перемещение файла (shutil операции блокирующие)
             if move_file(media_file, verify_location):
                 stats['moved'] += 1
                 moved_files.append(media_file)
+                
+                # Подсчет файлов, перемещенных в Unknown_Year
+                # Принудительное использование папки Unknown_Year для файлов без метаданных
+                if media_file.target_path and media_file.target_path.parent.name == 'Unknown_Year':
+                    stats['unknown_year_count'] += 1
+                
+                # Подсчет файлов не с Apple устройств (только для iPhone Mode)
+                if iphone_mode and media_file.target_path:
+                    # Проверка, что файл попал в Other_Devices
+                    if 'Other_Devices' in str(media_file.target_path):
+                        stats['non_iphone_count'] += 1
                 
                 # СИНХРОННАЯ запись в CSV-отчет сразу после успешного перемещения
                 # Программа ждет завершения записи перед переходом к следующему файлу
@@ -704,6 +713,11 @@ def main():
         else:
             safe_print("Неверный путь к целевой директории. Попробуйте снова.")
 
+    # Получение настройки iPhone Mode
+    iphone_mode = get_boolean_input(
+        "Включить iPhone Mode? (Сортировать только фото с Apple устройств, остальное в Unknown)", default=False
+    )
+    
     # Получение настройки проверки местоположения
     # Этот переключатель готов для работы с GPS-данными
     verify_location = get_boolean_input(
@@ -727,6 +741,13 @@ def main():
     
     # Показ сводки с данными о целостности (totals уже рассчитаны в collect_media_files)
     print_summary(source, destination, verify_location, file_count, initial_total_size)
+    
+    # Показ информации о iPhone Mode
+    if iphone_mode:
+        if RICH_AVAILABLE and console:
+            console.print(f"iPhone Mode: ВКЛЮЧЕН (только фото с Apple устройств будут отсортированы по годам)", style="bold yellow")
+        else:
+            safe_print(f"iPhone Mode: ВКЛЮЧЕН (только фото с Apple устройств будут отсортированы по годам)")
 
     # Подтверждение
     if not get_boolean_input("Продолжить сортировку?", default=True):
@@ -739,7 +760,7 @@ def main():
     # Выполнение сортировки (синхронная обработка с инкрементальной записью в CSV)
     # CSV-отчеты создаются инкрементально после каждого перемещенного файла
     # ВАЖНО: Все файлы обрабатываются синхронно, один за другим
-    stats = sort_media_files(source, destination, verify_location, show_progress=True)
+    stats = sort_media_files(source, destination, verify_location, show_progress=True, iphone_mode=iphone_mode)
     
     # Валидация выполняется ПОСЛЕ завершения всех синхронных операций перемещения
 
@@ -760,6 +781,25 @@ def main():
         safe_print(f"Успешно перемещено:  {stats['moved']}")
         safe_print(f"Ошибок:              {stats['failed']}")
         safe_print("=" * 60 + "\n")
+    
+    # Вывод предупреждения о файлах в Unknown_Year
+    # Принудительное использование папки Unknown_Year для файлов без метаданных
+    if stats.get('unknown_year_count', 0) > 0:
+        unknown_count = stats['unknown_year_count']
+        warning_msg = f"Внимание: {unknown_count} файлов перемещено в папку 'Unknown_Year', так как дату съемки определить не удалось."
+        if RICH_AVAILABLE and console:
+            console.print(warning_msg, style="bold yellow")
+        else:
+            safe_print(warning_msg)
+    
+    # Вывод информации о файлах не с Apple устройств (только для iPhone Mode)
+    if iphone_mode and stats.get('non_iphone_count', 0) > 0:
+        non_iphone_count = stats['non_iphone_count']
+        info_msg = f"iPhone Mode: {non_iphone_count} файлов не с Apple устройств перемещено в 'Unknown_Year/Other_Devices/'."
+        if RICH_AVAILABLE and console:
+            console.print(info_msg, style="bold cyan")
+        else:
+            safe_print(info_msg)
 
     # Контроль целостности данных: пост-обработка валидация
     # Сравнение результатов после сортировки с начальными данными

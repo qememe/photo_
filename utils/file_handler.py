@@ -262,6 +262,60 @@ def scan_directory_integrity(directory: Path, extensions: tuple) -> Tuple[int, i
     return (file_count, total_size)
 
 
+def get_target_path(media_file: MediaFile, destination: Path, iphone_mode: bool = False) -> Path:
+    """
+    Get target path for media file based on extracted date and iPhone Mode.
+    
+    Краткое описание: Генерирует целевой путь для медиафайла на основе года,
+    извлеченного из метаданных. Если iPhone Mode включен, сортирует только файлы
+    с Apple устройств по годам, остальные перемещает в Unknown_Year/Other_Devices/.
+    Если iPhone Mode выключен, использует стандартную логику сортировки по годам.
+
+    Args:
+        media_file: MediaFile instance
+        destination: Destination root directory
+        iphone_mode: If True, only Apple devices are sorted by year, others go to Unknown_Year/Other_Devices/
+
+    Returns:
+        Target path
+    """
+    # iPhone Mode filtering
+    if iphone_mode:
+        # Check if file is from Apple device
+        make = media_file.metadata.get('make', '').strip()
+        is_apple = make.lower() == 'apple'
+        
+        # Safety: PNG files or screenshots without Apple metadata go to Unknown_Year
+        # Also check file extension for PNG
+        is_png = media_file.source_path.suffix.lower() == '.png'
+        
+        # If not Apple device, or PNG without Apple metadata -> go to Other_Devices
+        if not is_apple:
+            # Non-Apple devices go to Unknown_Year/Other_Devices/
+            target_dir = destination / "Unknown_Year" / "Other_Devices"
+            target_path = target_dir / media_file.source_path.name
+            return target_path
+    
+    # Standard logic: Extract year from metadata
+    best_dt = media_file.get_earliest_timestamp()
+    if best_dt:
+        year = best_dt.year
+    else:
+        year = None
+    
+    # Use exact logic: if year is None -> "Unknown_Year", else use str(year)
+    if year is None:
+        target_year_folder = "Unknown_Year"
+    else:
+        target_year_folder = str(year)
+
+    # Form path: destination/target_year_folder/filename
+    target_dir = destination / target_year_folder
+    target_path = target_dir / media_file.source_path.name
+
+    return target_path
+
+
 def get_skipped_files_size(log_file: Path = Path("skipped_files.log")) -> int:
     """
     Подсчитать общий размер пропущенных файлов из лог-файла.
