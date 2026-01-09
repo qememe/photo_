@@ -5,21 +5,37 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
+# Setup error logger (separate from main logger)
+# Handler will be configured in main.py, but we set up the logger here
+_error_logger = logging.getLogger('process_errors')
+_error_logger.setLevel(logging.ERROR)
+# Prevent propagation to root logger to avoid console output
+_error_logger.propagate = False
+
 try:
     from exif import Image as ExifImage
 except ImportError:
     ExifImage = None
-    logging.warning("Библиотека exif недоступна")
 
 try:
     from mutagen import File as MutagenFile
     from mutagen.mp4 import MP4
     from mutagen.quicktime import QuickTime
+    MUTAGEN_AVAILABLE = True
 except ImportError:
     MutagenFile = None
     MP4 = None
     QuickTime = None
-    logging.warning("Библиотека mutagen недоступна")
+    MUTAGEN_AVAILABLE = False
+
+try:
+    from PIL import Image as PILImage
+    from PIL.ExifTags import TAGS
+    PILLOW_AVAILABLE = True
+except ImportError:
+    PILImage = None
+    TAGS = None
+    PILLOW_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -98,12 +114,58 @@ def extract_gps_from_image(exif_image: ExifImage) -> Optional[Tuple[float, float
         return None
 
 
+def extract_image_metadata_with_pillow(file_path: Path) -> Optional[Dict[str, Any]]:
+    """
+    Extract metadata from image using Pillow as fallback.
+    
+    Args:
+        file_path: Path to image file
+        
+    Returns:
+        Dictionary with metadata or None if extraction fails
+    """
+    if not PILLOW_AVAILABLE:
+        return None
+    
+    try:
+        with PILImage.open(file_path) as img:
+            exifdata = img.getexif()
+            if not exifdata:
+                return None
+            
+            metadata = {}
+            
+            # Extract datetime_original
+            for tag_id, value in exifdata.items():
+                tag = TAGS.get(tag_id, tag_id)
+                if tag == 'DateTimeOriginal' and value:
+                    try:
+                        metadata['datetime_original'] = datetime.strptime(
+                            str(value), '%Y:%m:%d %H:%M:%S'
+                        )
+                    except (ValueError, TypeError):
+                        pass
+                elif tag == 'DateTime' and value and 'datetime_original' not in metadata:
+                    try:
+                        metadata['datetime'] = datetime.strptime(
+                            str(value), '%Y:%m:%d %H:%M:%S'
+                        )
+                    except (ValueError, TypeError):
+                        pass
+            
+            return metadata if metadata else None
+    except Exception as e:
+        _error_logger.error(f"Pillow extraction failed for {file_path}: {e}", exc_info=False)
+        return None
+
+
 def extract_image_metadata(file_path: Path) -> Optional[Dict[str, Any]]:
     """
-    Extract EXIF metadata from image file.
+    Extract EXIF metadata from image file with robust error handling.
     
     Краткое описание: Извлекает EXIF-метаданные из файла изображения,
-    включая дату/время создания и GPS-координаты.
+    включая дату/время создания и GPS-координаты. Использует fallback на Pillow
+    и st_ctime при ошибках.
 
     Args:
         file_path: Path to image file
@@ -111,57 +173,62 @@ def extract_image_metadata(file_path: Path) -> Optional[Dict[str, Any]]:
     Returns:
         Dictionary with metadata or None if extraction fails
     """
-    if not ExifImage:
-        logger.warning("Библиотека exif не установлена, невозможно извлечь метаданные изображения")
-        return None
+    metadata = {}
+    
+    # Try exif library first
+    if ExifImage:
+        try:
+            with open(file_path, 'rb') as image_file:
+                exif_image = ExifImage(image_file)
 
-    try:
-        # Открытие файла в бинарном режиме для чтения EXIF
-        with open(file_path, 'rb') as image_file:
-            exif_image = ExifImage(image_file)
+            if exif_image.has_exif:
+                # Extract datetime_original
+                if hasattr(exif_image, 'datetime_original'):
+                    try:
+                        dt_str = exif_image.datetime_original
+                        metadata['datetime_original'] = datetime.strptime(
+                            dt_str, '%Y:%m:%d %H:%M:%S'
+                        )
+                    except (ValueError, AttributeError):
+                        pass
 
-        if not exif_image.has_exif:
-            logger.debug(f"Нет EXIF-данных в {file_path.name}")
-            return None
+                # Extract datetime
+                if hasattr(exif_image, 'datetime'):
+                    try:
+                        dt_str = exif_image.datetime
+                        metadata['datetime'] = datetime.strptime(
+                            dt_str, '%Y:%m:%d %H:%M:%S'
+                        )
+                    except (ValueError, AttributeError):
+                        pass
 
-        metadata = {}
-
-        # Извлечение даты и времени создания (datetime_original)
-        if hasattr(exif_image, 'datetime_original'):
-            try:
-                dt_str = exif_image.datetime_original
-                metadata['datetime_original'] = datetime.strptime(
-                    dt_str, '%Y:%m:%d %H:%M:%S'
-                )
-            except (ValueError, AttributeError) as e:
-                logger.debug(f"Не удалось распарсить datetime_original: {e}")
-
-        # Извлечение других полезных полей (datetime)
-        if hasattr(exif_image, 'datetime'):
-            try:
-                dt_str = exif_image.datetime
-                metadata['datetime'] = datetime.strptime(
-                    dt_str, '%Y:%m:%d %H:%M:%S'
-                )
-            except (ValueError, AttributeError):
-                pass
-
-        # Извлечение GPS-координат
-        gps_coords = extract_gps_from_image(exif_image)
-        if gps_coords:
-            metadata['gps_coordinates'] = gps_coords
-
-        logger.debug(f"Извлечены метаданные из {file_path.name}")
-        return metadata
-
-    except Exception as e:
-        logger.error(f"Ошибка извлечения EXIF из {file_path}: {e}")
-        return None
+                # Extract GPS coordinates
+                gps_coords = extract_gps_from_image(exif_image)
+                if gps_coords:
+                    metadata['gps_coordinates'] = gps_coords
+                    
+                if metadata:
+                    return metadata
+        except ValueError as e:
+            # TIFF byte order errors and similar - log to file, not console
+            _error_logger.error(f"EXIF extraction failed for {file_path}: {e}", exc_info=False)
+        except Exception as e:
+            # Other exif errors - log to file
+            _error_logger.error(f"EXIF extraction error for {file_path}: {e}", exc_info=False)
+    
+    # Fallback to Pillow
+    if not metadata and PILLOW_AVAILABLE:
+        pillow_metadata = extract_image_metadata_with_pillow(file_path)
+        if pillow_metadata:
+            metadata.update(pillow_metadata)
+    
+    # If still no metadata, return None (will fall back to st_ctime in get_best_timestamp)
+    return metadata if metadata else None
 
 
 def extract_video_metadata(file_path: Path) -> Optional[Dict[str, Any]]:
     """
-    Extract metadata from video file using mutagen.
+    Extract metadata from video file using mutagen with graceful handling.
     
     Краткое описание: Извлекает метаданные из видеофайла с помощью библиотеки mutagen,
     включая дату создания и GPS-координаты (если доступны).
@@ -172,8 +239,7 @@ def extract_video_metadata(file_path: Path) -> Optional[Dict[str, Any]]:
     Returns:
         Dictionary with metadata or None if extraction fails
     """
-    if not MutagenFile:
-        logger.warning("Библиотека mutagen не установлена, невозможно извлечь метаданные видео")
+    if not MUTAGEN_AVAILABLE:
         return None
 
     try:
@@ -290,14 +356,12 @@ def extract_video_metadata(file_path: Path) -> Optional[Dict[str, Any]]:
                     pass
 
         if metadata:
-            logger.debug(f"Извлечены метаданные из {file_path.name}")
             return metadata
         else:
-            logger.debug(f"Метаданные не найдены в {file_path.name}")
             return None
 
     except Exception as e:
-        logger.error(f"Ошибка извлечения метаданных видео из {file_path}: {e}")
+        _error_logger.error(f"Video metadata extraction error for {file_path}: {e}", exc_info=False)
         return None
 
 
@@ -430,7 +494,7 @@ def extract_metadata(file_path: Path) -> Dict[str, Any]:
     
     Краткое описание: Извлекает метаданные из медиафайла (изображение или видео).
     Использует функцию get_best_timestamp для выбора самой ранней валидной даты
-    с фильтрацией по порогу 2004 года.
+    с фильтрацией по порогу 2004 года. Все ошибки обрабатываются тихо, без вывода в консоль.
 
     Args:
         file_path: Path to media file
@@ -444,16 +508,28 @@ def extract_metadata(file_path: Path) -> Dict[str, Any]:
     metadata = {}
 
     # Извлечение метаданных в зависимости от типа файла
-    if suffix_lower in IMAGE_EXTENSIONS:
-        metadata = extract_image_metadata(file_path) or {}
-    elif suffix_lower in VIDEO_EXTENSIONS:
-        metadata = extract_video_metadata(file_path) or {}
+    # Все ошибки обрабатываются внутри функций и логируются в файл
+    try:
+        if suffix_lower in IMAGE_EXTENSIONS:
+            metadata = extract_image_metadata(file_path) or {}
+        elif suffix_lower in VIDEO_EXTENSIONS:
+            metadata = extract_video_metadata(file_path) or {}
+    except Exception as e:
+        # Дополнительная защита - любые неожиданные ошибки логируются в файл
+        _error_logger.error(f"Metadata extraction failed for {file_path}: {e}", exc_info=False)
+        metadata = {}
 
     # Использование get_best_timestamp для выбора лучшей даты
     # (собирает все даты из метаданных и файловой системы, фильтрует по 2004 году)
-    best_timestamp = get_best_timestamp(file_path, metadata)
-    if best_timestamp:
-        metadata['datetime_original'] = best_timestamp
+    # Если метаданные не извлечены, get_best_timestamp использует st_ctime как fallback
+    try:
+        best_timestamp = get_best_timestamp(file_path, metadata)
+        if best_timestamp:
+            metadata['datetime_original'] = best_timestamp
+    except Exception as e:
+        # Ошибки в get_best_timestamp также логируются тихо
+        _error_logger.error(f"get_best_timestamp failed for {file_path}: {e}", exc_info=False)
+    
     # Если best_timestamp == None, не устанавливаем datetime_original
     # Это позволит generate_target_path использовать fallback на "Unknown_Year"
 

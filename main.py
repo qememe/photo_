@@ -15,6 +15,7 @@ from utils.error_handler import CorruptedMetadataError, handle_file_errors
 from utils.file_handler import (
     MediaFile,
     get_files_by_extension,
+    get_skipped_files_size,
     move_file,
     scan_directory_integrity,
 )
@@ -88,15 +89,27 @@ def clear_screen():
 # Настройка кодировки перед конфигурацией логирования
 setup_encoding()
 
-# Конфигурация логирования
+# Создание директории для логов
+logs_dir = Path('logs')
+logs_dir.mkdir(exist_ok=True)
+
+# Конфигурация основного логирования (без вывода ошибок в консоль)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
     handlers=[
         logging.FileHandler('media_sorter.log', encoding='utf-8'),
-        logging.StreamHandler(sys.stdout),
+        # Убираем StreamHandler для основного логгера - консоль должна быть чистой
     ],
 )
+
+# Отдельный логгер для ошибок процесса (только в файл, не в консоль)
+error_logger = logging.getLogger('process_errors')
+error_logger.setLevel(logging.ERROR)
+error_file_handler = logging.FileHandler(logs_dir / 'process_errors.log', encoding='utf-8')
+error_file_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s'))
+error_logger.addHandler(error_file_handler)
+error_logger.propagate = False  # Не передавать в родительские логгеры
 
 logger = logging.getLogger(__name__)
 
@@ -187,25 +200,29 @@ def validate_path(path_str: str, must_exist: bool = True) -> Optional[Path]:
         return None
 
 
-def collect_media_files(source_dir: Path, show_progress: bool = True) -> List[MediaFile]:
+def collect_media_files(source_dir: Path, show_progress: bool = True) -> tuple[List[MediaFile], int, int]:
     """
-    Collect all media files from source directory.
+    Collect all media files from source directory and calculate totals.
     
     Краткое описание: Собирает все медиафайлы из исходной директории,
-    извлекает метаданные и создает объекты MediaFile.
+    извлекает метаданные и создает объекты MediaFile. Одновременно подсчитывает
+    общее количество файлов и общий размер для контроля целостности.
+    Сканирование выполняется ОДИН РАЗ.
 
     Args:
         source_dir: Source directory path
         show_progress: Whether to show progress bar
 
     Returns:
-        List of MediaFile objects
+        Tuple of (List of MediaFile objects, total_file_count, total_size_bytes)
     """
     # Объединение всех поддерживаемых расширений
     all_extensions = IMAGE_EXTENSIONS + VIDEO_EXTENSIONS
     file_paths = get_files_by_extension(source_dir, all_extensions)
 
     media_files = []
+    total_file_count = 0
+    total_size = 0
     
     # Обработка с индикатором прогресса, если доступна библиотека rich
     if show_progress and RICH_AVAILABLE:
@@ -221,25 +238,43 @@ def collect_media_files(source_dir: Path, show_progress: bool = True) -> List[Me
             task = progress.add_task("Сканирование файлов...", total=len(file_paths))
             for file_path in file_paths:
                 try:
+                    # Подсчет файлов и размера во время сканирования
+                    if file_path.is_file():
+                        total_file_count += 1
+                        try:
+                            total_size += file_path.stat().st_size
+                        except OSError:
+                            pass  # Размер не критичен, продолжаем
+                    
                     # Обработка ошибок файла с помощью контекстного менеджера
                     with handle_file_errors(file_path):
                         metadata = extract_metadata(file_path)
                         media_files.append(MediaFile(file_path, metadata=metadata))
                 except (CorruptedMetadataError, Exception) as e:
-                    logger.error(f"Ошибка обработки {file_path}: {e}")
+                    # Ошибки логируются в файл через error_logger в extract_metadata
+                    pass  # Не выводим в консоль
                 finally:
                     progress.update(task, advance=1)
     else:
         # Обработка без индикатора прогресса
         for file_path in file_paths:
             try:
+                # Подсчет файлов и размера во время сканирования
+                if file_path.is_file():
+                    total_file_count += 1
+                    try:
+                        total_size += file_path.stat().st_size
+                    except OSError:
+                        pass  # Размер не критичен, продолжаем
+                
                 with handle_file_errors(file_path):
                     metadata = extract_metadata(file_path)
                     media_files.append(MediaFile(file_path, metadata=metadata))
             except (CorruptedMetadataError, Exception) as e:
-                logger.error(f"Ошибка обработки {file_path}: {e}")
+                # Ошибки логируются в файл через error_logger в extract_metadata
+                pass  # Не выводим в консоль
 
-    return media_files
+    return (media_files, total_file_count, total_size)
 
 
 def generate_target_path(
@@ -345,7 +380,8 @@ def sort_media_files(
                 stats['failed'] += 1
 
         except Exception as e:
-            logger.error(f"Ошибка сортировки {media_file.source_path}: {e}")
+            # Ошибки логируются в файл через error_logger
+            error_logger.error(f"Ошибка сортировки {media_file.source_path}: {e}", exc_info=False)
             stats['failed'] += 1
 
     stats['moved_files'] = moved_files
@@ -397,6 +433,7 @@ def validate_integrity(
     
     Краткое описание: Сканирует целевую директорию после сортировки и сравнивает
     результаты с начальными данными. Учитывает пропущенные файлы из лог-файла.
+    Проверка выполняется ПОСЛЕ завершения всех синхронных операций перемещения.
 
     Args:
         source_dir: Исходная директория
@@ -410,17 +447,19 @@ def validate_integrity(
     """
     logger.info("Начало валидации целостности данных...")
     
-    # Сканирование целевой директории
+    # Сканирование целевой директории (после завершения всех перемещений)
     processed_file_count, processed_total_size = scan_directory_integrity(
         destination_dir, extensions
     )
     
-    # Подсчет пропущенных файлов
+    # Подсчет пропущенных файлов и их размера
     skipped_count = count_skipped_files()
+    skipped_files_size = get_skipped_files_size()
     
     # Расчет ожидаемых значений (с учетом пропущенных файлов)
+    # Source Size == (Destination Size + Skipped Files Size)
     expected_file_count = initial_file_count - skipped_count
-    expected_total_size = initial_total_size  # Размер должен совпадать (файлы перемещены, не скопированы)
+    expected_total_size = initial_total_size - skipped_files_size
     
     # Проверка целостности
     files_match = processed_file_count == expected_file_count
@@ -432,6 +471,7 @@ def validate_integrity(
         'processed_file_count': processed_file_count,
         'processed_total_size': processed_total_size,
         'skipped_count': skipped_count,
+        'skipped_files_size': skipped_files_size,
         'expected_file_count': expected_file_count,
         'expected_total_size': expected_total_size,
         'files_match': files_match,
@@ -670,12 +710,12 @@ def main():
         "Включить проверку местоположения (GPS данные готовы)", default=True
     )
 
-    # Сбор файлов для предпросмотра
+    # Сбор файлов для предпросмотра (ОДИН РАЗ - с подсчетом totals)
     if RICH_AVAILABLE and console:
         console.print("\nСканирование исходной директории...", style="yellow")
     else:
         safe_print("\nСканирование исходной директории...")
-    media_files = collect_media_files(source)
+    media_files, initial_file_count, initial_total_size = collect_media_files(source)
     file_count = len(media_files)
 
     if file_count == 0:
@@ -684,18 +724,8 @@ def main():
         else:
             safe_print("Медиафайлы не найдены в исходной директории.")
         sys.exit(0)
-
-    # Контроль целостности данных: предварительное сканирование исходной директории
-    # Подсчет общего количества файлов и размера для последующей валидации
-    if RICH_AVAILABLE and console:
-        console.print("Выполнение предварительного сканирования для контроля целостности...", style="yellow")
-    else:
-        safe_print("Выполнение предварительного сканирования для контроля целостности...")
     
-    all_extensions = IMAGE_EXTENSIONS + VIDEO_EXTENSIONS
-    initial_file_count, initial_total_size = scan_directory_integrity(source, all_extensions)
-    
-    # Показ сводки с данными о целостности
+    # Показ сводки с данными о целостности (totals уже рассчитаны в collect_media_files)
     print_summary(source, destination, verify_location, file_count, initial_total_size)
 
     # Подтверждение
@@ -708,7 +738,10 @@ def main():
 
     # Выполнение сортировки (синхронная обработка с инкрементальной записью в CSV)
     # CSV-отчеты создаются инкрементально после каждого перемещенного файла
+    # ВАЖНО: Все файлы обрабатываются синхронно, один за другим
     stats = sort_media_files(source, destination, verify_location, show_progress=True)
+    
+    # Валидация выполняется ПОСЛЕ завершения всех синхронных операций перемещения
 
     # Вывод результатов сортировки
     if RICH_AVAILABLE and console:
@@ -730,6 +763,8 @@ def main():
 
     # Контроль целостности данных: пост-обработка валидация
     # Сравнение результатов после сортировки с начальными данными
+    # Выполняется ПОСЛЕ завершения всех синхронных операций перемещения
+    all_extensions = IMAGE_EXTENSIONS + VIDEO_EXTENSIONS
     integrity_result = validate_integrity(
         source,
         destination,

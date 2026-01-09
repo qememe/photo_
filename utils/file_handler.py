@@ -3,7 +3,7 @@
 import logging
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Tuple
 
 from utils.error_handler import CorruptedMetadataError, handle_file_errors
 from utils.metadata_extractor import get_best_timestamp
@@ -212,13 +212,14 @@ def get_files_by_extension(directory: Path, extensions: tuple) -> list[Path]:
     return files
 
 
-def scan_directory_integrity(directory: Path, extensions: tuple) -> tuple[int, int]:
+def scan_directory_integrity(directory: Path, extensions: tuple) -> Tuple[int, int]:
     """
     Сканировать директорию для контроля целостности данных.
     
     Краткое описание: Сканирует директорию и все поддиректории, подсчитывает количество
     медиафайлов с указанными расширениями и вычисляет общий размер всех файлов в байтах.
     Используется для контроля целостности данных до и после сортировки.
+    Использует pathlib для всех операций с размерами.
 
     Args:
         directory: Директория для сканирования
@@ -238,12 +239,14 @@ def scan_directory_integrity(directory: Path, extensions: tuple) -> tuple[int, i
         # Получение всех файлов с указанными расширениями
         files = get_files_by_extension(directory, extensions)
         
-        # Подсчет файлов и суммирование размеров
+        # Подсчет файлов и суммирование размеров используя pathlib
         for file_path in files:
             try:
                 if file_path.is_file():
                     file_count += 1
-                    total_size += file_path.stat().st_size
+                    # Использование pathlib для получения размера
+                    stat_info = file_path.stat()
+                    total_size += stat_info.st_size
             except OSError as e:
                 logger.warning(f"Не удалось получить размер файла {file_path}: {e}")
                 # Продолжаем обработку других файлов
@@ -257,4 +260,42 @@ def scan_directory_integrity(directory: Path, extensions: tuple) -> tuple[int, i
         logger.error(f"Ошибка сканирования директории для контроля целостности {directory}: {e}")
     
     return (file_count, total_size)
+
+
+def get_skipped_files_size(log_file: Path = Path("skipped_files.log")) -> int:
+    """
+    Подсчитать общий размер пропущенных файлов из лог-файла.
+    
+    Краткое описание: Читает skipped_files.log и подсчитывает общий размер
+    всех пропущенных файлов.
+
+    Args:
+        log_file: Путь к лог-файлу пропущенных файлов
+
+    Returns:
+        Общий размер пропущенных файлов в байтах
+    """
+    total_size = 0
+    if log_file.exists():
+        try:
+            with open(log_file, 'r', encoding='utf-8') as f:
+                seen_files = set()
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        # Извлекаем путь к файлу (до символа |)
+                        file_path_str = line.split('|')[0].strip()
+                        if file_path_str and file_path_str not in seen_files:
+                            seen_files.add(file_path_str)
+                            try:
+                                file_path = Path(file_path_str)
+                                if file_path.exists() and file_path.is_file():
+                                    total_size += file_path.stat().st_size
+                            except (OSError, ValueError):
+                                # Файл может быть удален или путь невалиден
+                                pass
+        except Exception as e:
+            logger.warning(f"Не удалось прочитать размеры из skipped_files.log: {e}")
+    
+    return total_size
 
