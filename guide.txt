@@ -1,0 +1,148 @@
+Git Setup Guide / Руководство по настройке Git
+================================================
+
+ENGLISH / АНГЛИЙСКИЙ
+====================
+
+This guide will help you initialize or re-link the repository to 
+https://github.com/qememe/photo_.git and push the new modular structure.
+
+1. INITIALIZE/RE-LINK REPOSITORY
+   ------------------------------
+   
+   If the repository is not yet initialized:
+   
+   git init
+   git remote add origin https://github.com/qememe/photo_.git
+   
+   If you need to re-link to the repository:
+   
+   git remote remove origin
+   git remote add origin https://github.com/qememe/photo_.git
+   
+   Verify the remote:
+   
+   git remote -v
+
+2. STAGE ALL FILES
+   ---------------
+   
+   git add .
+   
+   Or add specific files:
+   
+   git add main.py
+   git add utils/
+   git add requirements.txt
+   git add README.md
+   git add .gitignore
+   git add guide.txt
+
+3. COMMIT CHANGES
+   --------------
+   
+   git commit -m "Refactor: Implement modular structure with CSV reporting and GPS extraction"
+   
+   Or a more detailed message:
+   
+   git commit -m "Refactor: Implement modular structure
+   
+   - Add CSV report generation with GPS coordinates
+   - Implement error handling with decorators/context managers
+   - Add progress bars using rich library
+   - Extract GPS coordinates from EXIF/metadata
+   - Add comprehensive documentation (RU/EN)
+   - Update project structure (main.py, utils/, resources/)"
+
+4. PUSH TO REPOSITORY
+   ------------------
+   
+   For the first push or to overwrite existing structure:
+   
+   git push -u origin main
+   
+   OR if you need to force push (overwrite existing repository):
+   
+   git push --force origin main
+   
+   WARNING: --force will overwrite the remote repository. 
+   Use only if you're sure you want to replace the existing code.
+
+5. VERIFY PUSH
+   -----------
+   
+   Check the repository on GitHub to ensure all files are present.
+
+RUSSIAN / РУССКИЙ
+=================
+
+Это руководство поможет вам инициализировать или переподключить 
+репозиторий к https://github.com/qememe/photo_.git и отправить 
+новую модульную структуру.
+
+1. ИНИЦИАЛИЗАЦИЯ/ПЕРЕПОДКЛЮЧЕНИЕ РЕПОЗИТОРИЯ
+   -----------------------------------------
+   
+   Если репозиторий еще не инициализирован:
+   
+   git init
+   git remote add origin https://github.com/qememe/photo_.git
+   
+   Если нужно переподключить репозиторий:
+   
+   git remote remove origin
+   git remote add origin https://github.com/qememe/photo_.git
+   
+   Проверьте удаленный репозиторий:
+   
+   git remote -v
+
+2. ДОБАВЛЕНИЕ ФАЙЛОВ
+   ----------------
+   
+   git add .
+   
+   Или добавьте конкретные файлы:
+   
+   git add main.py
+   git add utils/
+   git add requirements.txt
+   git add README.md
+   git add .gitignore
+   git add guide.txt
+
+3. СОЗДАНИЕ КОММИТА
+   ---------------
+   
+   git commit -m "Refactor: Implement modular structure with CSV reporting and GPS extraction"
+   
+   Или более подробное сообщение:
+   
+   git commit -m "Refactor: Implement modular structure
+   
+   - Add CSV report generation with GPS coordinates
+   - Implement error handling with decorators/context managers
+   - Add progress bars using rich library
+   - Extract GPS coordinates from EXIF/metadata
+   - Add comprehensive documentation (RU/EN)
+   - Update project structure (main.py, utils/, resources/)"
+
+4. ОТПРАВКА В РЕПОЗИТОРИЙ
+   ----------------------
+   
+   Для первой отправки или для перезаписи существующей структуры:
+   
+   git push -u origin main
+   
+   ИЛИ если нужно принудительно отправить (перезаписать существующий репозиторий):
+   
+   git push --force origin main
+   
+   ВНИМАНИЕ: --force перезапишет удаленный репозиторий. 
+   Используйте только если вы уверены, что хотите заменить существующий код.
+
+5. ПРОВЕРКА ОТПРАВКИ
+   -----------------
+   
+   Проверьте репозиторий на GitHub, чтобы убедиться, что все файлы присутствуют.
+

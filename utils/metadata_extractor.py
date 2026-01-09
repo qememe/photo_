@@ -1,0 +1,357 @@
+"""Metadata extraction for images and videos."""
+
+import logging
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Dict, Optional, Tuple
+
+try:
+    from exif import Image as ExifImage
+except ImportError:
+    ExifImage = None
+    logging.warning("Библиотека exif недоступна")
+
+try:
+    from mutagen import File as MutagenFile
+    from mutagen.mp4 import MP4
+    from mutagen.quicktime import QuickTime
+except ImportError:
+    MutagenFile = None
+    MP4 = None
+    QuickTime = None
+    logging.warning("Библиотека mutagen недоступна")
+
+logger = logging.getLogger(__name__)
+
+# Supported image formats
+IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.tiff', '.tif', '.heic', '.heif')
+# Supported video formats
+VIDEO_EXTENSIONS = ('.mp4', '.mov', '.avi', '.mkv', '.m4v', '.3gp', '.webm')
+
+
+def convert_gps_coordinates(gps_latitude: tuple, gps_longitude: tuple, 
+                            latitude_ref: str, longitude_ref: str) -> Optional[Tuple[float, float]]:
+    """
+    Convert GPS coordinates from EXIF format to Decimal Degrees.
+    
+    Краткое описание: Преобразует GPS-координаты из формата EXIF (градусы, минуты, секунды)
+    в десятичные градусы с учетом направления (N/S, E/W).
+
+    Args:
+        gps_latitude: Tuple of (degrees, minutes, seconds) for latitude
+        gps_longitude: Tuple of (degrees, minutes, seconds) for longitude
+        latitude_ref: Reference direction ('N' or 'S')
+        longitude_ref: Reference direction ('E' or 'W')
+
+    Returns:
+        Tuple of (latitude, longitude) in Decimal Degrees, or None if conversion fails
+    """
+    try:
+        # Преобразование широты из формата градусы/минуты/секунды в десятичные градусы
+        lat_deg, lat_min, lat_sec = gps_latitude
+        latitude = lat_deg + (lat_min / 60.0) + (lat_sec / 3600.0)
+        # Отрицательное значение для южного полушария
+        if latitude_ref.upper() == 'S':
+            latitude = -latitude
+
+        # Преобразование долготы из формата градусы/минуты/секунды в десятичные градусы
+        lon_deg, lon_min, lon_sec = gps_longitude
+        longitude = lon_deg + (lon_min / 60.0) + (lon_sec / 3600.0)
+        # Отрицательное значение для западного полушария
+        if longitude_ref.upper() == 'W':
+            longitude = -longitude
+
+        return (latitude, longitude)
+    except (ValueError, TypeError, AttributeError) as e:
+        logger.debug(f"Ошибка преобразования GPS-координат: {e}")
+        return None
+
+
+def extract_gps_from_image(exif_image: ExifImage) -> Optional[Tuple[float, float]]:
+    """
+    Extract GPS coordinates from EXIF image.
+    
+    Краткое описание: Извлекает GPS-координаты из EXIF-данных изображения
+    и преобразует их в формат десятичных градусов.
+
+    Args:
+        exif_image: ExifImage object
+
+    Returns:
+        Tuple of (latitude, longitude) in Decimal Degrees, or None
+    """
+    try:
+        # Проверка наличия GPS-данных в EXIF
+        if not hasattr(exif_image, 'gps_latitude') or not hasattr(exif_image, 'gps_longitude'):
+            return None
+
+        # Извлечение координат и направлений
+        gps_latitude = exif_image.gps_latitude
+        gps_longitude = exif_image.gps_longitude
+        latitude_ref = getattr(exif_image, 'gps_latitude_ref', 'N')
+        longitude_ref = getattr(exif_image, 'gps_longitude_ref', 'E')
+
+        # Преобразование в десятичные градусы
+        return convert_gps_coordinates(gps_latitude, gps_longitude, latitude_ref, longitude_ref)
+    except Exception as e:
+        logger.debug(f"Ошибка извлечения GPS из изображения: {e}")
+        return None
+
+
+def extract_image_metadata(file_path: Path) -> Optional[Dict[str, Any]]:
+    """
+    Extract EXIF metadata from image file.
+    
+    Краткое описание: Извлекает EXIF-метаданные из файла изображения,
+    включая дату/время создания и GPS-координаты.
+
+    Args:
+        file_path: Path to image file
+
+    Returns:
+        Dictionary with metadata or None if extraction fails
+    """
+    if not ExifImage:
+        logger.warning("Библиотека exif не установлена, невозможно извлечь метаданные изображения")
+        return None
+
+    try:
+        # Открытие файла в бинарном режиме для чтения EXIF
+        with open(file_path, 'rb') as image_file:
+            exif_image = ExifImage(image_file)
+
+        if not exif_image.has_exif:
+            logger.debug(f"Нет EXIF-данных в {file_path.name}")
+            return None
+
+        metadata = {}
+
+        # Извлечение даты и времени создания (datetime_original)
+        if hasattr(exif_image, 'datetime_original'):
+            try:
+                dt_str = exif_image.datetime_original
+                metadata['datetime_original'] = datetime.strptime(
+                    dt_str, '%Y:%m:%d %H:%M:%S'
+                )
+            except (ValueError, AttributeError) as e:
+                logger.debug(f"Не удалось распарсить datetime_original: {e}")
+
+        # Извлечение других полезных полей (datetime)
+        if hasattr(exif_image, 'datetime'):
+            try:
+                dt_str = exif_image.datetime
+                metadata['datetime'] = datetime.strptime(
+                    dt_str, '%Y:%m:%d %H:%M:%S'
+                )
+            except (ValueError, AttributeError):
+                pass
+
+        # Извлечение GPS-координат
+        gps_coords = extract_gps_from_image(exif_image)
+        if gps_coords:
+            metadata['gps_coordinates'] = gps_coords
+
+        logger.debug(f"Извлечены метаданные из {file_path.name}")
+        return metadata
+
+    except Exception as e:
+        logger.error(f"Ошибка извлечения EXIF из {file_path}: {e}")
+        return None
+
+
+def extract_video_metadata(file_path: Path) -> Optional[Dict[str, Any]]:
+    """
+    Extract metadata from video file using mutagen.
+    
+    Краткое описание: Извлекает метаданные из видеофайла с помощью библиотеки mutagen,
+    включая дату создания и GPS-координаты (если доступны).
+
+    Args:
+        file_path: Path to video file
+
+    Returns:
+        Dictionary with metadata or None if extraction fails
+    """
+    if not MutagenFile:
+        logger.warning("Библиотека mutagen не установлена, невозможно извлечь метаданные видео")
+        return None
+
+    try:
+        # Загрузка метаданных через mutagen
+        video_file = MutagenFile(str(file_path))
+        if not video_file:
+            logger.debug(f"Не удалось загрузить метаданные для {file_path.name}")
+            return None
+
+        metadata = {}
+
+        # Извлечение даты создания для MP4 файлов
+        if isinstance(video_file, MP4):
+            # MP4 использует ключи '©day' или '\xa9day' для даты создания
+            date_keys = ['©day', '\xa9day', '©DAY', '\xa9DAY']
+            for key in date_keys:
+                if key in video_file:
+                    try:
+                        date_str = str(video_file[key][0])
+                        # Формат обычно: "2023-12-25T10:30:00Z" или "2023-12-25"
+                        for fmt in ['%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M:%SZ', '%Y-%m-%d']:
+                            try:
+                                if fmt.endswith('Z'):
+                                    date_str_clean = date_str.rstrip('Z')
+                                    metadata['datetime_original'] = datetime.strptime(
+                                        date_str_clean, fmt[:-1]
+                                    )
+                                else:
+                                    metadata['datetime_original'] = datetime.strptime(
+                                        date_str, fmt
+                                    )
+                                break
+                            except ValueError:
+                                continue
+                        if 'datetime_original' in metadata:
+                            break
+                    except (ValueError, IndexError, AttributeError) as e:
+                        logger.debug(f"Ошибка парсинга даты из {key}: {e}")
+
+        # Извлечение даты создания для QuickTime (MOV) файлов
+        elif isinstance(video_file, QuickTime):
+            # QuickTime использует ключи '©day' или '\xa9day'
+            date_keys = ['©day', '\xa9day', '©DAY', '\xa9DAY']
+            for key in date_keys:
+                if key in video_file:
+                    try:
+                        date_str = str(video_file[key][0])
+                        for fmt in ['%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M:%SZ', '%Y-%m-%d']:
+                            try:
+                                if fmt.endswith('Z'):
+                                    date_str_clean = date_str.rstrip('Z')
+                                    metadata['datetime_original'] = datetime.strptime(
+                                        date_str_clean, fmt[:-1]
+                                    )
+                                else:
+                                    metadata['datetime_original'] = datetime.strptime(
+                                        date_str, fmt
+                                    )
+                                break
+                            except ValueError:
+                                continue
+                        if 'datetime_original' in metadata:
+                            break
+                    except (ValueError, IndexError, AttributeError) as e:
+                        logger.debug(f"Ошибка парсинга даты из {key}: {e}")
+
+        # Для других форматов пытаемся найти общие ключи
+        else:
+            # Попытка найти дату в общих тегах
+            common_date_keys = ['date', 'creation_date', '©day', '\xa9day']
+            for key in common_date_keys:
+                if key in video_file:
+                    try:
+                        date_str = str(video_file[key][0] if isinstance(video_file[key], list) else video_file[key])
+                        for fmt in ['%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M:%SZ', '%Y-%m-%d', '%Y:%m:%d %H:%M:%S']:
+                            try:
+                                if fmt.endswith('Z'):
+                                    date_str_clean = date_str.rstrip('Z')
+                                    metadata['datetime_original'] = datetime.strptime(
+                                        date_str_clean, fmt[:-1]
+                                    )
+                                else:
+                                    metadata['datetime_original'] = datetime.strptime(
+                                        date_str, fmt
+                                    )
+                                break
+                            except ValueError:
+                                continue
+                        if 'datetime_original' in metadata:
+                            break
+                    except (ValueError, IndexError, AttributeError, TypeError) as e:
+                        logger.debug(f"Ошибка парсинга даты из {key}: {e}")
+
+        # Попытка извлечения GPS-координат (редко встречается в видео)
+        # MP4 может хранить GPS в ключах '©xyz' или '\xa9xyz'
+        gps_keys = ['©xyz', '\xa9xyz', 'location', 'gps']
+        for key in gps_keys:
+            if key in video_file:
+                try:
+                    gps_data = video_file[key][0] if isinstance(video_file[key], list) else video_file[key]
+                    # Формат может быть разным, пытаемся распарсить
+                    if isinstance(gps_data, str):
+                        # Может быть в формате "lat,lon" или "+lat+lon"
+                        parts = gps_data.replace('+', '').split(',')
+                        if len(parts) >= 2:
+                            try:
+                                lat = float(parts[0])
+                                lon = float(parts[1])
+                                metadata['gps_coordinates'] = (lat, lon)
+                                break
+                            except ValueError:
+                                pass
+                except (ValueError, IndexError, AttributeError, TypeError):
+                    pass
+
+        if metadata:
+            logger.debug(f"Извлечены метаданные из {file_path.name}")
+            return metadata
+        else:
+            logger.debug(f"Метаданные не найдены в {file_path.name}")
+            return None
+
+    except Exception as e:
+        logger.error(f"Ошибка извлечения метаданных видео из {file_path}: {e}")
+        return None
+
+
+def get_file_creation_time(file_path: Path) -> datetime:
+    """
+    Get file system creation time as fallback.
+    
+    Краткое описание: Получает время создания файла из файловой системы
+    как резервный вариант, если метаданные недоступны.
+
+    Args:
+        file_path: Path to file
+
+    Returns:
+        datetime object
+    """
+    try:
+        stat = file_path.stat()
+        # Использование st_birthtime, если доступно (macOS, некоторые Linux), иначе st_mtime
+        timestamp = getattr(stat, 'st_birthtime', stat.st_mtime)
+        return datetime.fromtimestamp(timestamp)
+    except OSError as e:
+        logger.error(f"Ошибка получения времени создания файла для {file_path}: {e}")
+        return datetime.now()
+
+
+def extract_metadata(file_path: Path) -> Dict[str, Any]:
+    """
+    Extract metadata from media file (image or video).
+    
+    Краткое описание: Извлекает метаданные из медиафайла (изображение или видео).
+    Использует время создания файла из файловой системы как резервный вариант.
+
+    Args:
+        file_path: Path to media file
+
+    Returns:
+        Dictionary with metadata including datetime_original
+    """
+    file_path = Path(file_path)
+    suffix_lower = file_path.suffix.lower()
+
+    metadata = {}
+
+    # Извлечение метаданных в зависимости от типа файла
+    if suffix_lower in IMAGE_EXTENSIONS:
+        metadata = extract_image_metadata(file_path) or {}
+    elif suffix_lower in VIDEO_EXTENSIONS:
+        metadata = extract_video_metadata(file_path) or {}
+
+    # Резервный вариант: использование времени создания файла из файловой системы
+    if 'datetime_original' not in metadata:
+        metadata['datetime_original'] = get_file_creation_time(file_path)
+        logger.debug(f"Используется время создания файла из файловой системы для {file_path.name}")
+
+    return metadata
+
