@@ -140,10 +140,13 @@ def move_file(media_file: MediaFile, verify_location: bool = True) -> bool:
     
     Краткое описание: Перемещает файл из исходного местоположения в целевое.
     Обеспечивает уникальность имени файла и создает директории при необходимости.
+    Исправлены пути Windows и оптимизирован батник установки.
     
     ВАЖНО: Операция строго СИНХРОННАЯ. Используется shutil.rename() (через pathlib),
     который блокирует выполнение до завершения перемещения. Никаких потоков,
     процессов или асинхронных операций не используется.
+    
+    КРИТИЧНО: Директория создается ПЕРЕД перемещением файла для предотвращения WinError 3.
 
     Args:
         media_file: MediaFile instance to move
@@ -152,7 +155,8 @@ def move_file(media_file: MediaFile, verify_location: bool = True) -> bool:
     Returns:
         True if successful, False otherwise
     """
-    if not media_file.exists:
+    # Проверка существования исходного файла перед перемещением
+    if not media_file.source_path.exists():
         logger.error(f"Исходный файл не существует: {media_file.source_path}")
         return False
 
@@ -163,9 +167,10 @@ def move_file(media_file: MediaFile, verify_location: bool = True) -> bool:
     try:
         # Обработка ошибок файла с помощью контекстного менеджера
         with handle_file_errors(media_file.source_path):
-            # Создание целевой директории, если включена проверка местоположения
-            if verify_location:
-                ensure_directory(media_file.target_path.parent)
+            # КРИТИЧНО: Создание целевой директории ПЕРЕД любой операцией перемещения
+            # Используем pathlib.Path для кроссплатформенной совместимости
+            # Это предотвращает WinError 3 на Windows
+            media_file.target_path.parent.mkdir(parents=True, exist_ok=True)
 
             # СИНХРОННАЯ проверка и обеспечение уникальности имени файла ПЕРЕД перемещением
             # Функция get_unique_filename проверяет существование файла и инкрементирует индекс

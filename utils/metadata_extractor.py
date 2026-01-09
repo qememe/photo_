@@ -571,9 +571,10 @@ def get_xmp_brute_force_date(file_path: Path) -> Optional[datetime]:
     
     Opens file in binary mode, reads first 512KB, and searches for date patterns
     using regex. This method finds hidden XMP dates that standard libraries miss.
+    Использует pathlib.Path объекты для кроссплатформенной совместимости.
     
     Args:
-        file_path: Path to image file
+        file_path: Path to image file (pathlib.Path object)
         
     Returns:
         datetime object or None if no valid date found or date is outside 2004-2026 range
@@ -582,6 +583,7 @@ def get_xmp_brute_force_date(file_path: Path) -> Optional[datetime]:
     MAX_YEAR = 2026
     
     try:
+        # Использование pathlib.Path объекта для открытия файла
         with open(file_path, 'rb') as f:
             # Read first 512KB (524288 bytes)
             data = f.read(524288)
