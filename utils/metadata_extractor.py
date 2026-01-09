@@ -39,12 +39,23 @@ except ImportError:
     TAGS = None
     PILLOW_AVAILABLE = False
 
+try:
+    from hachoir.parser import createParser
+    from hachoir.metadata import extractMetadata
+    HACHOIR_AVAILABLE = True
+except ImportError:
+    createParser = None
+    extractMetadata = None
+    HACHOIR_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 # Supported image formats
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.tiff', '.tif', '.heic', '.heif')
 # Supported video formats
 VIDEO_EXTENSIONS = ('.mp4', '.mov', '.avi', '.mkv', '.m4v', '.3gp', '.webm')
+# Formats that should use hachoir (videos and HEIC)
+HACHOIR_FORMATS = ('.mov', '.mp4', '.heic', '.heif', '.m4v')
 
 
 def convert_gps_coordinates(gps_latitude: tuple, gps_longitude: tuple, 
@@ -113,6 +124,104 @@ def extract_gps_from_image(exif_image: ExifImage) -> Optional[Tuple[float, float
         return convert_gps_coordinates(gps_latitude, gps_longitude, latitude_ref, longitude_ref)
     except Exception as e:
         logger.debug(f"Ошибка извлечения GPS из изображения: {e}")
+        return None
+
+
+def extract_metadata_with_hachoir(file_path: Path) -> Optional[Dict[str, Any]]:
+    """
+    Extract metadata from file using hachoir (for MOV/MP4/HEIC and TiffByteOrder errors).
+    
+    Краткое описание: Извлекает метаданные из файла с помощью hachoir.
+    Используется для видео (MOV/MP4) и HEIC файлов, а также для файлов с ошибками TiffByteOrder.
+    Определяет Apple устройства по метаданным.
+    
+    Args:
+        file_path: Path to media file
+        
+    Returns:
+        Dictionary with metadata or None if extraction fails or date is invalid
+    """
+    if not HACHOIR_AVAILABLE:
+        return None
+    
+    MIN_DATE = datetime(2004, 1, 1)
+    MAX_YEAR = 2026
+    metadata = {}
+    is_apple_device = False
+    
+    try:
+        parser = createParser(str(file_path))
+        if not parser:
+            return None
+        
+        # Use parser as context manager
+        with parser:
+            hachoir_metadata = extractMetadata(parser)
+            if not hachoir_metadata:
+                return None
+        
+            # Extract creation date - hachoir metadata has various date attributes
+            creation_date = None
+            # Try different date attributes that hachoir might provide
+            for attr in ['creation_date', 'date', 'date_creation', 'creation_time']:
+                if hasattr(hachoir_metadata, attr):
+                    try:
+                        creation_date = getattr(hachoir_metadata, attr)
+                        if creation_date:
+                            break
+                    except (AttributeError, TypeError):
+                        continue
+            
+            if creation_date:
+                try:
+                    # hachoir may return datetime objects or strings
+                    if isinstance(creation_date, datetime):
+                        parsed_date = creation_date
+                    else:
+                        # Try to parse string dates
+                        date_str = str(creation_date)
+                        for fmt in ['%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%d', '%Y:%m:%d %H:%M:%S']:
+                            try:
+                                parsed_date = datetime.strptime(date_str, fmt)
+                                break
+                            except ValueError:
+                                continue
+                        else:
+                            parsed_date = None
+                    
+                    if parsed_date:
+                        # Filter: before 2004 or after 2026 -> discard
+                        if parsed_date >= MIN_DATE and parsed_date.year <= MAX_YEAR:
+                            metadata['datetime_original'] = parsed_date
+                except (ValueError, TypeError, AttributeError):
+                    pass
+            
+            # Check for Apple device indicators
+            # HEIC files are typically from Apple devices
+            suffix_lower = file_path.suffix.lower()
+            if suffix_lower in ('.heic', '.heif'):
+                is_apple_device = True
+            
+            # Check metadata for Apple identifiers
+            for attr in ['producer', 'author', 'comment', 'software']:
+                if hasattr(hachoir_metadata, attr):
+                    try:
+                        value = str(getattr(hachoir_metadata, attr)).lower()
+                        if 'apple' in value:
+                            is_apple_device = True
+                            break
+                    except (AttributeError, TypeError):
+                        continue
+            
+            # Set make to Apple if detected
+            if is_apple_device:
+                metadata['make'] = 'Apple'
+                logger.debug(f"Hachoir detected Apple device for {file_path.name}")
+        
+        return metadata if metadata else None
+        
+    except Exception as e:
+        _error_logger.error(f"Hachoir extraction failed for {file_path}: {e}", exc_info=False)
         return None
 
 
@@ -285,11 +394,25 @@ def extract_image_metadata(file_path: Path) -> Optional[Dict[str, Any]]:
                 if 'datetime_original' in metadata or 'datetime' in metadata:
                     return metadata
         except ValueError as e:
-            # TIFF byte order errors and similar - log to file, not console
+            # TIFF byte order errors and similar - try hachoir as fallback
+            error_str = str(e).lower()
+            if 'tiff' in error_str or 'byte order' in error_str:
+                logger.info(f"TiffByteOrder error detected, trying hachoir: {file_path.name}")
+                hachoir_metadata = extract_metadata_with_hachoir(file_path)
+                if hachoir_metadata:
+                    return hachoir_metadata
+            # Log to file, not console
             _error_logger.error(f"EXIF extraction failed for {file_path}: {e}", exc_info=False)
         except Exception as e:
             # Other exif errors - log to file
             _error_logger.error(f"EXIF extraction error for {file_path}: {e}", exc_info=False)
+    
+    # Шаг 1.5: Try hachoir for HEIC/HEIF files or if file extension suggests video
+    suffix_lower = file_path.suffix.lower()
+    if suffix_lower in HACHOIR_FORMATS:
+        hachoir_metadata = extract_metadata_with_hachoir(file_path)
+        if hachoir_metadata:
+            return hachoir_metadata
     
     # Шаг 2: Fallback на Pillow (для PNG и других форматов)
     if not metadata and PILLOW_AVAILABLE:
@@ -355,6 +478,13 @@ def extract_video_metadata(file_path: Path) -> Optional[Dict[str, Any]]:
     # Обновлен фильтр дат: теперь разрешен 2026 год для актуальных файлов
     MIN_DATE = datetime(2004, 1, 1)
     MAX_YEAR = 2026
+    
+    # Try hachoir first for MOV/MP4 files (before mutagen)
+    suffix_lower = file_path.suffix.lower()
+    if suffix_lower in ('.mov', '.mp4', '.m4v') and HACHOIR_AVAILABLE:
+        hachoir_metadata = extract_metadata_with_hachoir(file_path)
+        if hachoir_metadata:
+            return hachoir_metadata
     
     if not MUTAGEN_AVAILABLE:
         # Попробовать бинарный поиск перед fallback на системные статистики
@@ -542,6 +672,11 @@ def extract_video_metadata(file_path: Path) -> Optional[Dict[str, Any]]:
 
     except Exception as e:
         _error_logger.error(f"Video metadata extraction error for {file_path}: {e}", exc_info=False)
+        # Try hachoir as fallback for video files
+        if HACHOIR_AVAILABLE:
+            hachoir_metadata = extract_metadata_with_hachoir(file_path)
+            if hachoir_metadata:
+                return hachoir_metadata
         # Попробовать бинарный поиск перед fallback на системные статистики
         binary_date = get_video_binary_date(file_path)
         if binary_date:

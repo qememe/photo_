@@ -342,6 +342,7 @@ def sort_media_files(
         'moved': 0,
         'failed': 0,
         'skipped': 0,
+        'duplicates_skipped': 0,  # Счетчик пропущенных дубликатов (идентичных файлов)
         'unknown_year_count': 0,  # Счетчик файлов, перемещенных в Unknown_Year
         'non_iphone_count': 0,  # Счетчик файлов не с Apple устройств (только для iPhone Mode)
     }
@@ -367,24 +368,33 @@ def sort_media_files(
             media_file.target_path = target_path
 
             # СИНХРОННОЕ перемещение файла (shutil операции блокирующие)
-            if move_file(media_file, verify_location):
-                stats['moved'] += 1
-                moved_files.append(media_file)
-                
-                # Подсчет файлов, перемещенных в Unknown_Year
-                # Принудительное использование папки Unknown_Year для файлов без метаданных
-                if media_file.target_path and media_file.target_path.parent.name == 'Unknown_Year':
-                    stats['unknown_year_count'] += 1
-                
-                # Подсчет файлов не с Apple устройств (только для iPhone Mode)
-                if iphone_mode and media_file.target_path:
-                    # Проверка, что файл попал в Other_Devices
-                    if 'Other_Devices' in str(media_file.target_path):
-                        stats['non_iphone_count'] += 1
-                
-                # СИНХРОННАЯ запись в CSV-отчет сразу после успешного перемещения
-                # Программа ждет завершения записи перед переходом к следующему файлу
-                append_to_csv_report(media_file, include_location=verify_location)
+            # move_file теперь возвращает (success: bool, skipped: bool)
+            success, skipped = move_file(media_file, verify_location)
+            if success:
+                if skipped:
+                    # Файл был пропущен как дубликат (идентичный файл уже существует)
+                    stats['duplicates_skipped'] += 1
+                    stats['skipped'] += 1
+                    logger.info(f"Пропущен дубликат: {media_file.source_path.name}")
+                else:
+                    # Файл успешно перемещен
+                    stats['moved'] += 1
+                    moved_files.append(media_file)
+                    
+                    # Подсчет файлов, перемещенных в Unknown_Year
+                    # Принудительное использование папки Unknown_Year для файлов без метаданных
+                    if media_file.target_path and media_file.target_path.parent.name == 'Unknown_Year':
+                        stats['unknown_year_count'] += 1
+                    
+                    # Подсчет файлов не с Apple устройств (только для iPhone Mode)
+                    if iphone_mode and media_file.target_path:
+                        # Проверка, что файл попал в Other_Devices
+                        if 'Other_Devices' in str(media_file.target_path):
+                            stats['non_iphone_count'] += 1
+                    
+                    # СИНХРОННАЯ запись в CSV-отчет сразу после успешного перемещения
+                    # Программа ждет завершения записи перед переходом к следующему файлу
+                    append_to_csv_report(media_file, include_location=verify_location)
             else:
                 stats['failed'] += 1
 
@@ -764,13 +774,14 @@ def main():
     
     # Валидация выполняется ПОСЛЕ завершения всех синхронных операций перемещения
 
-    # Вывод результатов сортировки
+    # Вывод результатов сортировки с итоговой статистикой
     if RICH_AVAILABLE and console:
         console.print("\n" + "=" * 60, style="bold green")
         console.print("СОРТИРОВКА ЗАВЕРШЕНА", style="bold green")
         console.print("=" * 60, style="bold green")
         console.print(f"Всего файлов:        {stats['total']}", style="white")
-        console.print(f"Успешно перемещено:  {stats['moved']}", style="green")
+        console.print(f"Добавлено новых файлов: {stats['moved']}", style="green")
+        console.print(f"Пропущено (дубликаты): {stats['duplicates_skipped']}", style="yellow" if stats['duplicates_skipped'] > 0 else "white")
         console.print(f"Ошибок:              {stats['failed']}", style="red" if stats['failed'] > 0 else "white")
         console.print("=" * 60 + "\n", style="bold green")
     else:
@@ -778,7 +789,8 @@ def main():
         safe_print("СОРТИРОВКА ЗАВЕРШЕНА")
         safe_print("=" * 60)
         safe_print(f"Всего файлов:        {stats['total']}")
-        safe_print(f"Успешно перемещено:  {stats['moved']}")
+        safe_print(f"Добавлено новых файлов: {stats['moved']}")
+        safe_print(f"Пропущено (дубликаты): {stats['duplicates_skipped']}")
         safe_print(f"Ошибок:              {stats['failed']}")
         safe_print("=" * 60 + "\n")
     

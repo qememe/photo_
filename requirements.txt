@@ -1,4 +1,5 @@
 exif>=1.6.0
 mutagen>=1.47.0
 rich>=13.0.0
+hachoir>=3.2.0
 

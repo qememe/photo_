@@ -1,6 +1,7 @@
 """File handling operations using pathlib."""
 
 import logging
+import shutil
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -69,16 +70,19 @@ class MediaFile:
 
 def ensure_directory(path: Path) -> None:
     """
-    Create directory if it doesn't exist.
+    Create directory if it doesn't exist (safe mode: APPEND, not RECREATE).
     
     Краткое описание: Создает директорию, если она не существует.
     Создает все родительские директории при необходимости.
+    Использует pathlib.mkdir(parents=True, exist_ok=True) для безопасности:
+    если папка уже существует, просто использует её (режим APPEND).
 
     Args:
         path: Directory path to create
     """
     try:
         # Создание директории с родительскими директориями, если нужно
+        # exist_ok=True гарантирует, что если папка уже существует, она просто используется
         path.mkdir(parents=True, exist_ok=True)
         logger.debug(f"Директория обеспечена: {path}")
     except OSError as e:
@@ -86,12 +90,35 @@ def ensure_directory(path: Path) -> None:
         raise
 
 
-def get_unique_filename(target_dir: Path, filename: str) -> Path:
+def compare_files(file1: Path, file2: Path) -> bool:
     """
-    Generate unique filename if duplicate exists (synchronous check).
+    Compare two files by size to check if they are identical.
+    
+    Краткое описание: Сравнивает два файла по размеру для проверки идентичности.
+    Если размеры совпадают, файлы считаются идентичными.
+
+    Args:
+        file1: First file path
+        file2: Second file path
+
+    Returns:
+        True if files have same size (identical), False otherwise
+    """
+    try:
+        if not file1.exists() or not file2.exists():
+            return False
+        return file1.stat().st_size == file2.stat().st_size
+    except OSError:
+        return False
+
+
+def get_unique_filename(target_dir: Path, filename: str, source_file: Optional[Path] = None) -> Tuple[Path, bool]:
+    """
+    Generate unique filename if duplicate exists, with file comparison.
     
     Краткое описание: Генерирует уникальное имя файла, добавляя суффикс с номером,
-    если файл с таким именем уже существует. Защищено от бесконечных циклов.
+    если файл с таким именем уже существует. Сравнивает файлы по размеру - если
+    идентичны, возвращает флаг skip=True. Защищено от бесконечных циклов.
     
     ВАЖНО: Эта функция выполняется СИНХРОННО перед копированием/перемещением файла.
     Проверка существования файла происходит ДО операции перемещения, что гарантирует
@@ -100,16 +127,23 @@ def get_unique_filename(target_dir: Path, filename: str) -> Path:
     Args:
         target_dir: Target directory path
         filename: Original filename
+        source_file: Source file path for comparison (optional)
 
     Returns:
-        Unique file path
+        Tuple of (unique file path, skip_flag) where skip_flag=True if file already exists and is identical
     """
     target_path = target_dir / filename
 
     # СИНХРОННАЯ проверка: если файл не существует, возвращаем исходное имя
     # Эта проверка выполняется ДО операции копирования/перемещения
     if not target_path.exists():
-        return target_path
+        return (target_path, False)
+
+    # Если файл существует и есть source_file для сравнения, проверяем идентичность
+    if source_file and source_file.exists():
+        if compare_files(source_file, target_path):
+            logger.info(f"Файл уже существует (идентичен), пропускаем: {target_path.name}")
+            return (target_path, True)
 
     # Извлекаем имя без расширения и само расширение
     stem = target_path.stem
@@ -121,7 +155,12 @@ def get_unique_filename(target_dir: Path, filename: str) -> Path:
     # СИНХРОННЫЙ поиск уникального имени: проверяем существование и инкрементируем индекс
     # Только после нахождения уникального имени будет выполнена операция перемещения
     while target_path.exists() and counter < MAX_ATTEMPTS:
-        new_name = f"{stem}_{counter}{suffix}"
+        # Если есть source_file, проверяем идентичность перед переименованием
+        if source_file and source_file.exists():
+            if compare_files(source_file, target_path):
+                logger.info(f"Файл уже существует (идентичен), пропускаем: {target_path.name}")
+                return (target_path, True)
+        new_name = f"{stem}_copy_{counter}{suffix}"
         target_path = target_dir / new_name
         counter += 1
 
@@ -131,63 +170,98 @@ def get_unique_filename(target_dir: Path, filename: str) -> Path:
         raise OSError(f"Не удалось найти уникальное имя файла после {MAX_ATTEMPTS} попыток")
 
     logger.debug(f"Дубликат обнаружен, используется: {target_path.name}")
-    return target_path
+    return (target_path, False)
 
 
-def move_file(media_file: MediaFile, verify_location: bool = True) -> bool:
+def move_file(media_file: MediaFile, verify_location: bool = True) -> Tuple[bool, bool]:
     """
-    Move file from source to target location (synchronous operation).
+    Move file from source to target location using safe copy+verify+delete pattern.
     
-    Краткое описание: Перемещает файл из исходного местоположения в целевое.
-    Обеспечивает уникальность имени файла и создает директории при необходимости.
-    Исправлены пути Windows и оптимизирован батник установки.
+    Краткое описание: Безопасно перемещает файл из исходного местоположения в целевое
+    используя паттерн копирование+проверка+удаление. НИКОГДА не перезаписывает существующие файлы.
+    Если файл с таким именем уже существует и идентичен (по размеру), пропускает перемещение.
+    Если файл существует но отличается, переименовывает новый файл с суффиксом _copy_N.
     
-    ВАЖНО: Операция строго СИНХРОННАЯ. Используется shutil.rename() (через pathlib),
-    который блокирует выполнение до завершения перемещения. Никаких потоков,
-    процессов или асинхронных операций не используется.
+    ВАЖНО: Операция строго СИНХРОННАЯ. Используется shutil.copy2() для копирования,
+    затем проверка существования целевого файла, и только после успешной проверки
+    удаляется исходный файл. Никаких потоков, процессов или асинхронных операций не используется.
     
-    КРИТИЧНО: Директория создается ПЕРЕД перемещением файла для предотвращения WinError 3.
+    КРИТИЧНО: 
+    - Директория создается ПЕРЕД копированием файла для предотвращения WinError 3
+    - Режим APPEND: существующие файлы и папки остаются нетронутыми
+    - Удаление исходного файла происходит ТОЛЬКО после успешного копирования и проверки
 
     Args:
         media_file: MediaFile instance to move
         verify_location: Verify target directory exists before moving
 
     Returns:
-        True if successful, False otherwise
+        Tuple of (success: bool, skipped: bool) where skipped=True if file was skipped as duplicate
     """
     # Проверка существования исходного файла перед перемещением
     if not media_file.source_path.exists():
         logger.error(f"Исходный файл не существует: {media_file.source_path}")
-        return False
+        return (False, False)
 
     if not media_file.target_path:
         logger.error(f"Целевой путь не указан для {media_file.source_path}")
-        return False
+        return (False, False)
 
     try:
         # Обработка ошибок файла с помощью контекстного менеджера
         with handle_file_errors(media_file.source_path):
-            # КРИТИЧНО: Создание целевой директории ПЕРЕД любой операцией перемещения
-            # Используем pathlib.Path для кроссплатформенной совместимости
-            # Это предотвращает WinError 3 на Windows
+            # КРИТИЧНО: Создание целевой директории ПЕРЕД любой операцией
+            # Используем pathlib.Path.mkdir(parents=True, exist_ok=True) для безопасности
+            # Если папка уже существует, просто используем её (режим APPEND)
             media_file.target_path.parent.mkdir(parents=True, exist_ok=True)
 
-            # СИНХРОННАЯ проверка и обеспечение уникальности имени файла ПЕРЕД перемещением
-            # Функция get_unique_filename проверяет существование файла и инкрементирует индекс
-            # только после нахождения уникального имени выполняется операция перемещения
-            media_file.target_path = get_unique_filename(
-                media_file.target_path.parent, media_file.target_path.name
+            # СИНХРОННАЯ проверка и обеспечение уникальности имени файла ПЕРЕД копированием
+            # Функция get_unique_filename проверяет существование файла, сравнивает размеры
+            # и возвращает флаг skip=True если файл идентичен
+            unique_path, should_skip = get_unique_filename(
+                media_file.target_path.parent, 
+                media_file.target_path.name,
+                source_file=media_file.source_path
             )
+            
+            # Если файл уже существует и идентичен, пропускаем перемещение
+            if should_skip:
+                logger.info(f"Файл уже существует (идентичен), пропускаем: {media_file.source_path.name}")
+                return (True, True)
+            
+            # Обновляем целевой путь на уникальное имя (если было переименование)
+            media_file.target_path = unique_path
 
-            # СИНХРОННОЕ переименование (перемещение) файла
-            # pathlib.Path.rename() - блокирующая операция, программа ждет завершения
-            media_file.source_path.rename(media_file.target_path)
+            # БЕЗОПАСНОЕ КОПИРОВАНИЕ: используем shutil.copy2() для сохранения метаданных
+            # Это НЕ перезаписывает существующие файлы (get_unique_filename уже проверил)
+            shutil.copy2(media_file.source_path, media_file.target_path)
+            
+            # КРИТИЧНО: Проверка существования целевого файла после копирования
+            if not media_file.target_path.exists():
+                logger.error(f"Целевой файл не найден после копирования: {media_file.target_path}")
+                return (False, False)
+            
+            # Проверка размера для дополнительной безопасности
+            source_size = media_file.source_path.stat().st_size
+            target_size = media_file.target_path.stat().st_size
+            if source_size != target_size:
+                logger.error(f"Размеры файлов не совпадают после копирования: {source_size} != {target_size}")
+                # Удаляем неполный целевой файл
+                try:
+                    media_file.target_path.unlink()
+                except OSError:
+                    pass
+                return (False, False)
+            
+            # ТОЛЬКО ПОСЛЕ УСПЕШНОГО КОПИРОВАНИЯ И ПРОВЕРКИ: удаляем исходный файл
+            media_file.source_path.unlink()
+            
             logger.info(f"Перемещено: {media_file.source_path} -> {media_file.target_path}")
-            return True
+            return (True, False)
 
     except (PermissionError, FileExistsError, OSError) as e:
         logger.error(f"Не удалось переместить {media_file.source_path}: {e}")
-        return False
+        return (False, False)
 
 
 def get_files_by_extension(directory: Path, extensions: tuple) -> list[Path]:
