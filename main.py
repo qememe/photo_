@@ -16,6 +16,7 @@ from utils.file_handler import (
     MediaFile,
     get_files_by_extension,
     move_file,
+    scan_directory_integrity,
 )
 from utils.metadata_extractor import (
     IMAGE_EXTENSIONS,
@@ -248,7 +249,8 @@ def generate_target_path(
     Generate target path for media file based on year.
     
     Краткое описание: Генерирует целевой путь для медиафайла на основе года,
-    извлеченного из метаданных или текущего года.
+    извлеченного из метаданных с использованием стратегии выбора самой ранней даты.
+    Если год не найден, используется папка "Unknown_Year" вместо текущего года.
 
     Args:
         media_file: MediaFile instance
@@ -260,12 +262,12 @@ def generate_target_path(
     """
     # Извлечение года из метаданных, если не указан явно
     if not year:
-        dt = media_file.metadata.get('datetime_original')
-        if isinstance(dt, datetime):
-            year = dt.year
+        best_dt = media_file.get_earliest_timestamp()  # Использует новую логику с фильтрацией 2004 года
+        if best_dt:
+            year = best_dt.year
         else:
-            # Использование текущего года, если метаданные отсутствуют
-            year = datetime.now().year
+            # Fallback на "Unknown_Year" вместо текущего года
+            year = "Unknown_Year"
 
     # Формирование пути: destination/год/имя_файла
     target_dir = destination / str(year)
@@ -350,6 +352,209 @@ def sort_media_files(
     return stats
 
 
+def count_skipped_files(log_file: Path = Path("skipped_files.log")) -> int:
+    """
+    Подсчитать количество пропущенных файлов из лог-файла.
+    
+    Краткое описание: Читает skipped_files.log и подсчитывает количество
+    уникальных файлов, которые были пропущены во время обработки.
+
+    Args:
+        log_file: Путь к лог-файлу пропущенных файлов
+
+    Returns:
+        Количество пропущенных файлов
+    """
+    skipped_count = 0
+    if log_file.exists():
+        try:
+            with open(log_file, 'r', encoding='utf-8') as f:
+                # Каждая строка содержит путь к файлу до символа |
+                seen_files = set()
+                for line in f:
+                    line = line.strip()
+                    if line:
+                        # Извлекаем путь к файлу (до символа |)
+                        file_path = line.split('|')[0].strip()
+                        if file_path and file_path not in seen_files:
+                            seen_files.add(file_path)
+                            skipped_count += 1
+        except Exception as e:
+            logger.warning(f"Не удалось прочитать skipped_files.log: {e}")
+    
+    return skipped_count
+
+
+def validate_integrity(
+    source_dir: Path,
+    destination_dir: Path,
+    initial_file_count: int,
+    initial_total_size: int,
+    extensions: tuple
+) -> dict:
+    """
+    Валидация целостности данных после сортировки.
+    
+    Краткое описание: Сканирует целевую директорию после сортировки и сравнивает
+    результаты с начальными данными. Учитывает пропущенные файлы из лог-файла.
+
+    Args:
+        source_dir: Исходная директория
+        destination_dir: Целевая директория
+        initial_file_count: Начальное количество файлов
+        initial_total_size: Начальный общий размер в байтах
+        extensions: Кортеж расширений файлов
+
+    Returns:
+        Словарь с результатами валидации
+    """
+    logger.info("Начало валидации целостности данных...")
+    
+    # Сканирование целевой директории
+    processed_file_count, processed_total_size = scan_directory_integrity(
+        destination_dir, extensions
+    )
+    
+    # Подсчет пропущенных файлов
+    skipped_count = count_skipped_files()
+    
+    # Расчет ожидаемых значений (с учетом пропущенных файлов)
+    expected_file_count = initial_file_count - skipped_count
+    expected_total_size = initial_total_size  # Размер должен совпадать (файлы перемещены, не скопированы)
+    
+    # Проверка целостности
+    files_match = processed_file_count == expected_file_count
+    size_match = processed_total_size == expected_total_size
+    
+    integrity_result = {
+        'initial_file_count': initial_file_count,
+        'initial_total_size': initial_total_size,
+        'processed_file_count': processed_file_count,
+        'processed_total_size': processed_total_size,
+        'skipped_count': skipped_count,
+        'expected_file_count': expected_file_count,
+        'expected_total_size': expected_total_size,
+        'files_match': files_match,
+        'size_match': size_match,
+        'is_valid': files_match and size_match
+    }
+    
+    return integrity_result
+
+
+def format_size(size_bytes: int) -> str:
+    """
+    Форматировать размер в байтах в читаемый формат.
+    
+    Args:
+        size_bytes: Размер в байтах
+        
+    Returns:
+        Отформатированная строка с размером
+    """
+    size_gb = size_bytes / (1024 ** 3)
+    size_mb = size_bytes / (1024 ** 2)
+    if size_gb >= 1:
+        return f"{size_gb:.2f} ГБ ({size_bytes:,} байт)"
+    else:
+        return f"{size_mb:.2f} МБ ({size_bytes:,} байт)"
+
+
+def display_integrity_report(integrity_result: dict) -> None:
+    """
+    Отобразить отчет о целостности данных с использованием rich форматирования.
+    
+    Краткое описание: Выводит финальный отчет о целостности данных с подсветкой
+    предупреждений, если обнаружены несоответствия.
+
+    Args:
+        integrity_result: Словарь с результатами валидации целостности
+    """
+    initial_size_str = format_size(integrity_result['initial_total_size'])
+    processed_size_str = format_size(integrity_result['processed_total_size'])
+    
+    if RICH_AVAILABLE:
+        from rich.table import Table
+        
+        console = Console()
+        console.print("\n" + "=" * 70, style="bold blue")
+        console.print("ОТЧЕТ О ЦЕЛОСТНОСТИ ДАННЫХ", style="bold blue")
+        console.print("=" * 70, style="bold blue")
+        
+        # Создание таблицы
+        table = Table(show_header=True, header_style="bold magenta")
+        table.add_column("Параметр", style="cyan", width=30)
+        table.add_column("Значение", style="white", width=40)
+        
+        table.add_row("Файлов обнаружено", str(integrity_result['initial_file_count']))
+        table.add_row("Файлов обработано", str(integrity_result['processed_file_count']))
+        table.add_row("Файлов пропущено", str(integrity_result['skipped_count']))
+        
+        # Подсветка несоответствий
+        files_status = "✓ Соответствует" if integrity_result['files_match'] else "⚠ НЕ СООТВЕТСТВУЕТ"
+        files_style = "green" if integrity_result['files_match'] else "bold red"
+        table.add_row("Проверка файлов", files_status, style=files_style)
+        
+        table.add_row("", "")  # Пустая строка для разделения
+        
+        table.add_row("Общий размер (исходный)", initial_size_str)
+        table.add_row("Общий размер (обработанный)", processed_size_str)
+        
+        size_status = "✓ Соответствует" if integrity_result['size_match'] else "⚠ НЕ СООТВЕТСТВУЕТ"
+        size_style = "green" if integrity_result['size_match'] else "bold red"
+        table.add_row("Проверка размера", size_status, style=size_style)
+        
+        console.print(table)
+        
+        # Предупреждения о несоответствиях
+        if not integrity_result['is_valid']:
+            console.print("\n⚠ ПРЕДУПРЕЖДЕНИЕ: Обнаружены несоответствия!", style="bold yellow")
+            if not integrity_result['files_match']:
+                diff = integrity_result['expected_file_count'] - integrity_result['processed_file_count']
+                console.print(
+                    f"   • Разница в количестве файлов: {abs(diff)} "
+                    f"({'недостает' if diff > 0 else 'лишних'})",
+                    style="yellow"
+                )
+            if not integrity_result['size_match']:
+                size_diff = integrity_result['expected_total_size'] - integrity_result['processed_total_size']
+                console.print(
+                    f"   • Разница в размере: {format_size(abs(size_diff))} "
+                    f"({'недостает' if size_diff > 0 else 'лишних'})",
+                    style="yellow"
+                )
+            console.print("   Проверьте логи для деталей.", style="yellow")
+        else:
+            console.print("\n✓ Целостность данных подтверждена", style="bold green")
+        
+        console.print("=" * 70 + "\n", style="bold blue")
+    else:
+        safe_print("\n" + "=" * 70)
+        safe_print("ОТЧЕТ О ЦЕЛОСТНОСТИ ДАННЫХ")
+        safe_print("=" * 70)
+        safe_print(f"Файлов обнаружено:        {integrity_result['initial_file_count']}")
+        safe_print(f"Файлов обработано:       {integrity_result['processed_file_count']}")
+        safe_print(f"Файлов пропущено:        {integrity_result['skipped_count']}")
+        safe_print(f"Проверка файлов:         {'✓ Соответствует' if integrity_result['files_match'] else '⚠ НЕ СООТВЕТСТВУЕТ'}")
+        safe_print("")
+        safe_print(f"Общий размер (исходный):  {initial_size_str}")
+        safe_print(f"Общий размер (обработанный): {processed_size_str}")
+        safe_print(f"Проверка размера:         {'✓ Соответствует' if integrity_result['size_match'] else '⚠ НЕ СООТВЕТСТВУЕТ'}")
+        
+        if not integrity_result['is_valid']:
+            safe_print("\n⚠ ПРЕДУПРЕЖДЕНИЕ: Обнаружены несоответствия!")
+            if not integrity_result['files_match']:
+                diff = integrity_result['expected_file_count'] - integrity_result['processed_file_count']
+                safe_print(f"   • Разница в количестве файлов: {abs(diff)}")
+            if not integrity_result['size_match']:
+                size_diff = integrity_result['expected_total_size'] - integrity_result['processed_total_size']
+                safe_print(f"   • Разница в размере: {format_size(abs(size_diff))}")
+        else:
+            safe_print("\n✓ Целостность данных подтверждена")
+        
+        safe_print("=" * 70 + "\n")
+
+
 def safe_print(text: str) -> None:
     """
     Safely print text handling encoding issues on Windows.
@@ -367,18 +572,29 @@ def safe_print(text: str) -> None:
         print(safe_text)
 
 
-def print_summary(source: Path, destination: Path, verify: bool, file_count: int):
+def print_summary(
+    source: Path, 
+    destination: Path, 
+    verify: bool, 
+    file_count: int,
+    total_size: int
+):
     """
-    Print confirmation summary before starting.
+    Print confirmation summary before starting with integrity check data.
     
-    Краткое описание: Выводит сводку подтверждения перед началом сортировки.
+    Краткое описание: Выводит сводку подтверждения перед началом сортировки,
+    включая данные контроля целостности (количество файлов и общий размер).
 
     Args:
         source: Source directory
         destination: Destination directory
         verify: Location verification flag (ready for GPS data integration)
         file_count: Number of files to process
+        total_size: Total size of files in bytes
     """
+    # Форматирование размера для отображения
+    size_str = format_size(total_size)
+    
     if RICH_AVAILABLE:
         console = Console()
         console.print("\n" + "=" * 60, style="bold cyan")
@@ -388,6 +604,7 @@ def print_summary(source: Path, destination: Path, verify: bool, file_count: int
         console.print(f"Целевая директория:       {destination}", style="white")
         console.print(f"Проверка местоположения:  {'Да' if verify else 'Нет'} (GPS данные готовы)", style="green" if verify else "yellow")
         console.print(f"Файлов к обработке:       {file_count}", style="white")
+        console.print(f"Общий размер:             {size_str}", style="white")
         console.print("=" * 60 + "\n", style="bold cyan")
     else:
         safe_print("\n" + "=" * 60)
@@ -397,6 +614,7 @@ def print_summary(source: Path, destination: Path, verify: bool, file_count: int
         safe_print(f"Целевая директория:       {destination}")
         safe_print(f"Проверка местоположения:  {'Да' if verify else 'Нет'} (GPS данные готовы)")
         safe_print(f"Файлов к обработке:       {file_count}")
+        safe_print(f"Общий размер:             {size_str}")
         safe_print("=" * 60 + "\n")
 
 
@@ -467,8 +685,18 @@ def main():
             safe_print("Медиафайлы не найдены в исходной директории.")
         sys.exit(0)
 
-    # Показ сводки
-    print_summary(source, destination, verify_location, file_count)
+    # Контроль целостности данных: предварительное сканирование исходной директории
+    # Подсчет общего количества файлов и размера для последующей валидации
+    if RICH_AVAILABLE and console:
+        console.print("Выполнение предварительного сканирования для контроля целостности...", style="yellow")
+    else:
+        safe_print("Выполнение предварительного сканирования для контроля целостности...")
+    
+    all_extensions = IMAGE_EXTENSIONS + VIDEO_EXTENSIONS
+    initial_file_count, initial_total_size = scan_directory_integrity(source, all_extensions)
+    
+    # Показ сводки с данными о целостности
+    print_summary(source, destination, verify_location, file_count, initial_total_size)
 
     # Подтверждение
     if not get_boolean_input("Продолжить сортировку?", default=True):
@@ -482,7 +710,7 @@ def main():
     # CSV-отчеты создаются инкрементально после каждого перемещенного файла
     stats = sort_media_files(source, destination, verify_location, show_progress=True)
 
-    # Вывод результатов
+    # Вывод результатов сортировки
     if RICH_AVAILABLE and console:
         console.print("\n" + "=" * 60, style="bold green")
         console.print("СОРТИРОВКА ЗАВЕРШЕНА", style="bold green")
@@ -499,6 +727,19 @@ def main():
         safe_print(f"Успешно перемещено:  {stats['moved']}")
         safe_print(f"Ошибок:              {stats['failed']}")
         safe_print("=" * 60 + "\n")
+
+    # Контроль целостности данных: пост-обработка валидация
+    # Сравнение результатов после сортировки с начальными данными
+    integrity_result = validate_integrity(
+        source,
+        destination,
+        initial_file_count,
+        initial_total_size,
+        all_extensions
+    )
+    
+    # Отображение финального отчета о целостности данных
+    display_integrity_report(integrity_result)
 
 
 if __name__ == "__main__":

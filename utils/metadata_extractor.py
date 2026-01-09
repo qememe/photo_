@@ -355,62 +355,107 @@ def get_file_creation_time(file_path: Path) -> datetime:
         return datetime.now()
 
 
+def get_best_timestamp(file_path: Path, metadata: Optional[Dict[str, Any]] = None) -> Optional[datetime]:
+    """
+    Получить лучшую (самую раннюю) временную метку из всех доступных источников.
+    
+    Краткое описание: Собирает все доступные даты из метаданных (EXIF для фото,
+    заголовки медиа для видео) и файловой системы, фильтрует их по порогу 2004 года
+    (чтобы отсечь системные значения по умолчанию типа 1970 или 1900) и возвращает
+    самую раннюю валидную дату.
+    
+    Порог 2004 года выбран для фильтрации "мусорных" дат, которые могут появиться
+    при сбое часов камеры или системных настройках по умолчанию.
+
+    Args:
+        file_path: Путь к медиафайлу
+        metadata: Опциональный словарь метаданных (если None, будет извлечен автоматически)
+
+    Returns:
+        datetime объект с самой ранней валидной датой или None, если не найдено ни одной
+        валидной даты после 2004-01-01
+    """
+    file_path = Path(file_path)
+    suffix_lower = file_path.suffix.lower()
+    
+    # Порог 2004-01-01 для фильтрации системных значений по умолчанию
+    MIN_DATE = datetime(2004, 1, 1)
+    
+    all_dates = []
+    
+    # Извлечение метаданных, если не предоставлены
+    if metadata is None:
+        if suffix_lower in IMAGE_EXTENSIONS:
+            metadata = extract_image_metadata(file_path) or {}
+        elif suffix_lower in VIDEO_EXTENSIONS:
+            metadata = extract_video_metadata(file_path) or {}
+        else:
+            metadata = {}
+    
+    # Сбор всех дат из метаданных
+    if 'datetime_original' in metadata and isinstance(metadata['datetime_original'], datetime):
+        all_dates.append(metadata['datetime_original'])
+    if 'datetime' in metadata and isinstance(metadata['datetime'], datetime):
+        all_dates.append(metadata['datetime'])
+    
+    # Добавление всех временных меток из файловой системы
+    filesystem_timestamps = get_all_file_timestamps(file_path)
+    all_dates.extend(filesystem_timestamps)
+    
+    # Фильтрация: только даты после 2004-01-01 и не None
+    valid_dates = [
+        dt for dt in all_dates 
+        if dt is not None and isinstance(dt, datetime) and dt >= MIN_DATE
+    ]
+    
+    # Возврат самой ранней даты или None
+    if valid_dates:
+        best_date = min(valid_dates)
+        logger.debug(
+            f"Найдена лучшая дата для {file_path.name}: {best_date.strftime('%Y-%m-%d %H:%M:%S')} "
+            f"(отфильтровано {len(valid_dates)} из {len(all_dates)} временных меток)"
+        )
+        return best_date
+    else:
+        logger.warning(
+            f"Не найдено валидных дат после 2004-01-01 для {file_path.name} "
+            f"(найдено {len(all_dates)} временных меток, все отфильтрованы)"
+        )
+        return None
+
+
 def extract_metadata(file_path: Path) -> Dict[str, Any]:
     """
     Extract metadata from media file (image or video) with oldest date strategy.
     
     Краткое описание: Извлекает метаданные из медиафайла (изображение или видео).
-    Собирает ВСЕ доступные временные метки и выбирает самую старую (самую раннюю по времени).
-    
-    Стратегия выбора самой старой даты:
-    - Гарантирует получение реальной даты съемки/создания, даже если файл был
-      недавно перемещен или модифицирован
-    - Сравнивает все доступные источники: EXIF datetime_original, EXIF datetime,
-      даты создания видео, временные метки файловой системы (st_ctime, st_mtime, st_birthtime)
-    - Выбирает самую раннюю дату как наиболее вероятную дату создания контента
+    Использует функцию get_best_timestamp для выбора самой ранней валидной даты
+    с фильтрацией по порогу 2004 года.
 
     Args:
         file_path: Path to media file
 
     Returns:
-        Dictionary with metadata including datetime_original (oldest date found)
+        Dictionary with metadata including datetime_original (best date found, or None)
     """
     file_path = Path(file_path)
     suffix_lower = file_path.suffix.lower()
 
     metadata = {}
-    all_dates = []  # Список всех найденных дат для выбора самой старой
 
     # Извлечение метаданных в зависимости от типа файла
     if suffix_lower in IMAGE_EXTENSIONS:
         metadata = extract_image_metadata(file_path) or {}
-        # Добавляем все найденные даты из EXIF
-        if 'datetime_original' in metadata:
-            all_dates.append(metadata['datetime_original'])
-        if 'datetime' in metadata:
-            all_dates.append(metadata['datetime'])
     elif suffix_lower in VIDEO_EXTENSIONS:
         metadata = extract_video_metadata(file_path) or {}
-        # Добавляем дату создания видео, если найдена
-        if 'datetime_original' in metadata:
-            all_dates.append(metadata['datetime_original'])
 
-    # Добавление всех временных меток из файловой системы
-    filesystem_timestamps = get_all_file_timestamps(file_path)
-    all_dates.extend(filesystem_timestamps)
-
-    # Выбор самой старой (самой ранней) даты из всех найденных
-    if all_dates:
-        oldest_date = min(all_dates)
-        metadata['datetime_original'] = oldest_date
-        logger.debug(
-            f"Выбрана самая старая дата для {file_path.name}: {oldest_date.strftime('%Y-%m-%d %H:%M:%S')} "
-            f"(найдено {len(all_dates)} временных меток)"
-        )
-    else:
-        # Резервный вариант: использование текущего времени (крайне редкий случай)
-        metadata['datetime_original'] = datetime.now()
-        logger.warning(f"Не найдено ни одной временной метки для {file_path.name}, используется текущее время")
+    # Использование get_best_timestamp для выбора лучшей даты
+    # (собирает все даты из метаданных и файловой системы, фильтрует по 2004 году)
+    best_timestamp = get_best_timestamp(file_path, metadata)
+    if best_timestamp:
+        metadata['datetime_original'] = best_timestamp
+    # Если best_timestamp == None, не устанавливаем datetime_original
+    # Это позволит generate_target_path использовать fallback на "Unknown_Year"
 
     return metadata
 

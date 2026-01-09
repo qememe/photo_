@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 
 from utils.error_handler import CorruptedMetadataError, handle_file_errors
+from utils.metadata_extractor import get_best_timestamp
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,20 @@ class MediaFile:
     def size(self) -> int:
         """Get file size in bytes."""
         return self.source_path.stat().st_size if self.exists else 0
+
+    def get_earliest_timestamp(self) -> Optional[datetime]:
+        """
+        Получить самую раннюю временную метку из всех доступных источников.
+        
+        Краткое описание: Использует get_best_timestamp для получения самой ранней
+        валидной даты с фильтрацией по порогу 2004 года. Собирает все даты из
+        метаданных (EXIF, медиа заголовки) и файловой системы.
+
+        Returns:
+            datetime объект с самой ранней валидной датой или None, если не найдено
+            ни одной валидной даты после 2004-01-01
+        """
+        return get_best_timestamp(self.source_path, self.metadata)
 
 
 def ensure_directory(path: Path) -> None:
@@ -195,4 +210,51 @@ def get_files_by_extension(directory: Path, extensions: tuple) -> list[Path]:
         logger.error(f"Ошибка сканирования директории {directory}: {e}")
 
     return files
+
+
+def scan_directory_integrity(directory: Path, extensions: tuple) -> tuple[int, int]:
+    """
+    Сканировать директорию для контроля целостности данных.
+    
+    Краткое описание: Сканирует директорию и все поддиректории, подсчитывает количество
+    медиафайлов с указанными расширениями и вычисляет общий размер всех файлов в байтах.
+    Используется для контроля целостности данных до и после сортировки.
+
+    Args:
+        directory: Директория для сканирования
+        extensions: Кортеж расширений файлов (например, ('.jpg', '.png', '.mp4'))
+
+    Returns:
+        Кортеж (количество_файлов, общий_размер_в_байтах)
+    """
+    file_count = 0
+    total_size = 0
+    
+    try:
+        if not directory.exists():
+            logger.warning(f"Директория не существует: {directory}")
+            return (0, 0)
+        
+        # Получение всех файлов с указанными расширениями
+        files = get_files_by_extension(directory, extensions)
+        
+        # Подсчет файлов и суммирование размеров
+        for file_path in files:
+            try:
+                if file_path.is_file():
+                    file_count += 1
+                    total_size += file_path.stat().st_size
+            except OSError as e:
+                logger.warning(f"Не удалось получить размер файла {file_path}: {e}")
+                # Продолжаем обработку других файлов
+        
+        logger.info(
+            f"Сканирование целостности {directory}: найдено {file_count} файлов, "
+            f"общий размер {total_size:,} байт ({total_size / (1024**2):.2f} МБ)"
+        )
+        
+    except Exception as e:
+        logger.error(f"Ошибка сканирования директории для контроля целостности {directory}: {e}")
+    
+    return (file_count, total_size)
 
