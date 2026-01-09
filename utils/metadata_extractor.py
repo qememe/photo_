@@ -357,6 +357,10 @@ def extract_video_metadata(file_path: Path) -> Optional[Dict[str, Any]]:
     MAX_YEAR = 2026
     
     if not MUTAGEN_AVAILABLE:
+        # Попробовать бинарный поиск перед fallback на системные статистики
+        binary_date = get_video_binary_date(file_path)
+        if binary_date:
+            return {'datetime_original': binary_date}
         # Fallback на системные статистики только если дата в допустимом диапазоне
         system_date = get_system_fallback_date(file_path)
         if system_date:
@@ -365,9 +369,14 @@ def extract_video_metadata(file_path: Path) -> Optional[Dict[str, Any]]:
 
     try:
         # Загрузка метаданных через mutagen
+        # Use pathlib Path object for Windows long path support
         video_file = MutagenFile(str(file_path))
         if not video_file:
             logger.debug(f"Не удалось загрузить метаданные для {file_path.name}")
+            # Попробовать бинарный поиск перед fallback на системные статистики
+            binary_date = get_video_binary_date(file_path)
+            if binary_date:
+                return {'datetime_original': binary_date}
             # Fallback на системные статистики только если дата в допустимом диапазоне
             system_date = get_system_fallback_date(file_path)
             if system_date:
@@ -514,7 +523,13 @@ def extract_video_metadata(file_path: Path) -> Optional[Dict[str, Any]]:
                 except (ValueError, IndexError, AttributeError, TypeError):
                     pass
 
-        # Если не найдена дата в метаданных, fallback на системные статистики
+        # Если не найдена дата в метаданных, попробовать бинарный поиск (ПЕРЕД системными статистиками)
+        if 'datetime_original' not in metadata:
+            binary_date = get_video_binary_date(file_path)
+            if binary_date:
+                metadata['datetime_original'] = binary_date
+        
+        # Если бинарный поиск не дал результата, fallback на системные статистики
         if 'datetime_original' not in metadata:
             system_date = get_system_fallback_date(file_path)
             if system_date:
@@ -527,6 +542,10 @@ def extract_video_metadata(file_path: Path) -> Optional[Dict[str, Any]]:
 
     except Exception as e:
         _error_logger.error(f"Video metadata extraction error for {file_path}: {e}", exc_info=False)
+        # Попробовать бинарный поиск перед fallback на системные статистики
+        binary_date = get_video_binary_date(file_path)
+        if binary_date:
+            return {'datetime_original': binary_date}
         # Fallback на системные статистики при ошибке, только если дата в допустимом диапазоне
         system_date = get_system_fallback_date(file_path)
         if system_date:
@@ -627,6 +646,103 @@ def get_xmp_brute_force_date(file_path: Path) -> Optional[datetime]:
         return None
 
 
+def get_video_binary_date(file_path: Path) -> Optional[datetime]:
+    """
+    Deep scan for video file dates using binary search.
+    
+    Scans the first 1MB of video files (.MOV, .MP4) for date patterns in binary data.
+    Searches for ISO 8601 dates and standard date formats that may be embedded
+    in video metadata tags (mvhd, mdhd, cmeta, etc.).
+    Использует pathlib.Path объекты для кроссплатформенной совместимости.
+    
+    Args:
+        file_path: Path to video file (pathlib.Path object)
+        
+    Returns:
+        datetime object or None if no valid date found or date is outside 2004-2026 range
+    """
+    MIN_DATE = datetime(2004, 1, 1)
+    MAX_YEAR = 2026
+    
+    try:
+        # Log the deep scan attempt
+        logger.info(f"Deep scanning video file for hidden timestamps: {file_path.name}")
+        
+        # Использование pathlib.Path объекта для открытия файла
+        with open(file_path, 'rb') as f:
+            # Read first 1MB (1048576 bytes) for video files
+            data = f.read(1048576)
+        
+        # Pattern 1: Standard date format (YYYY:MM:DD or YYYY-MM-DD with time)
+        pattern1 = rb'(\d{4}[:\-](\d{2})[:\-](\d{2})[ T](\d{2})[:](\d{2})[:](\d{2}))'
+        
+        # Pattern 2: ISO 8601 format (YYYY-MM-DDTHH:MM:SS) - often found in videos
+        pattern2 = rb'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})'
+        
+        # Try Pattern 1 first (standard format)
+        match = re.search(pattern1, data)
+        if match:
+            date_str_bytes = match.group(0)
+            date_str = date_str_bytes.decode('utf-8', errors='ignore')
+            
+            formats = [
+                '%Y:%m:%d %H:%M:%S',
+                '%Y-%m-%d %H:%M:%S',
+                '%Y:%m:%dT%H:%M:%S',
+                '%Y-%m-%dT%H:%M:%S'
+            ]
+            
+            for fmt in formats:
+                try:
+                    parsed_date = datetime.strptime(date_str, fmt)
+                    # Apply 2004-2026 year filter
+                    if parsed_date >= MIN_DATE and parsed_date.year <= MAX_YEAR:
+                        logger.debug(f"Video binary scan (pattern1) found date: {parsed_date} in {file_path.name}")
+                        return parsed_date
+                except ValueError:
+                    continue
+        
+        # Try Pattern 2 (ISO 8601)
+        match = re.search(pattern2, data)
+        if match:
+            date_str_bytes = match.group(0)
+            date_str = date_str_bytes.decode('utf-8', errors='ignore')
+            
+            # Clean up the date string - remove timezone info if present
+            # ISO 8601: YYYY-MM-DDTHH:MM:SS or YYYY-MM-DDTHH:MM:SSZ
+            # Remove Z suffix and any timezone offset
+            date_str_clean = date_str.rstrip('Z')
+            # Remove timezone offset if present (e.g., +00:00, -05:00)
+            if '+' in date_str_clean:
+                date_str_clean = date_str_clean.split('+')[0]
+            elif date_str_clean.count('-') > 2:  # Has timezone offset like -05:00
+                # Find the T separator and take everything before the last timezone part
+                if 'T' in date_str_clean:
+                    parts = date_str_clean.split('T')
+                    if len(parts) == 2:
+                        time_part = parts[1]
+                        # Remove timezone offset (format: HH:MM:SS-XX:XX)
+                        if '-' in time_part and time_part.count(':') > 2:
+                            time_part = ':'.join(time_part.split(':')[:3])  # Take first 3 parts (HH:MM:SS)
+                        date_str_clean = f"{parts[0]}T{time_part}"
+            
+            # Try parsing the cleaned ISO 8601 format
+            if len(date_str_clean) == 19:  # YYYY-MM-DDTHH:MM:SS
+                try:
+                    parsed_date = datetime.strptime(date_str_clean, '%Y-%m-%dT%H:%M:%S')
+                    # Apply 2004-2026 year filter
+                    if parsed_date >= MIN_DATE and parsed_date.year <= MAX_YEAR:
+                        logger.debug(f"Video binary scan (pattern2 ISO 8601) found date: {parsed_date} in {file_path.name}")
+                        return parsed_date
+                except ValueError:
+                    pass
+        
+        return None
+    except Exception as e:
+        logger.debug(f"Video binary scan failed for {file_path}: {e}")
+        return None
+
+
 def get_system_fallback_date(file_path: Path) -> Optional[datetime]:
     """
     Get system fallback date using only os.path.getmtime and os.path.getctime.
@@ -642,6 +758,7 @@ def get_system_fallback_date(file_path: Path) -> Optional[datetime]:
     MAX_YEAR = 2026
     
     try:
+        # Use pathlib Path object for Windows long path support
         mtime = os.path.getmtime(str(file_path))
         ctime = os.path.getctime(str(file_path))
         system_date = datetime.fromtimestamp(min(mtime, ctime))
