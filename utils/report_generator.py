@@ -143,6 +143,60 @@ def _build_csv_row(media_file: MediaFile, include_location: bool) -> Optional[Di
         return None
 
 
+def append_to_csv_report(
+    media_file: MediaFile,
+    include_location: bool = True
+) -> bool:
+    """
+    Добавить запись о медиафайле в CSV-отчет года (инкрементальная запись).
+    
+    Краткое описание: Добавляет одну запись о перемещенном медиафайле в CSV-отчет
+    соответствующего года. Создает файл и заголовок, если файл не существует.
+    Используется для синхронной записи после каждого перемещенного файла.
+
+    Args:
+        media_file: MediaFile instance that was moved
+        include_location: Whether to include Location column
+
+    Returns:
+        True if successful, False otherwise
+    """
+    if not media_file.target_path:
+        return False
+
+    year_dir = media_file.target_path.parent
+    csv_path = year_dir / "report.csv"
+
+    try:
+        # Определение колонок CSV-файла
+        fieldnames = ['filename', 'format', 'date', 'time']
+        if include_location:
+            fieldnames.append('Location')
+
+        # Проверка существования файла для определения режима записи
+        file_exists = csv_path.exists()
+
+        # Открытие файла в режиме добавления (если существует) или создания (если нет)
+        with open(csv_path, 'a', newline='', encoding='utf-8') as csvfile:
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            
+            # Запись заголовка, если файл только что создан
+            if not file_exists:
+                writer.writeheader()
+
+            # Построение и запись строки CSV
+            row = _build_csv_row(media_file, include_location)
+            if row:
+                writer.writerow(row)
+
+        logger.debug(f"Добавлена запись в CSV-отчет: {csv_path}")
+        return True
+
+    except Exception as e:
+        logger.error(f"Ошибка добавления записи в CSV-отчет {csv_path}: {e}")
+        return False
+
+
 def generate_reports_for_all_years(
     destination_dir: Path,
     all_media_files: List[MediaFile],

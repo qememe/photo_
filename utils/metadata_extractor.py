@@ -301,6 +301,37 @@ def extract_video_metadata(file_path: Path) -> Optional[Dict[str, Any]]:
         return None
 
 
+def get_all_file_timestamps(file_path: Path) -> list[datetime]:
+    """
+    Получить все доступные временные метки файла из файловой системы.
+    
+    Краткое описание: Извлекает все доступные временные метки из файловой системы:
+    - st_ctime (время изменения статуса/создания)
+    - st_mtime (время модификации)
+    - st_birthtime (время создания, если доступно на системе)
+    
+    Args:
+        file_path: Path to file
+
+    Returns:
+        List of datetime objects (may be empty if stat fails)
+    """
+    timestamps = []
+    try:
+        stat = file_path.stat()
+        # st_ctime - время последнего изменения статуса файла (на Linux это время создания inode)
+        timestamps.append(datetime.fromtimestamp(stat.st_ctime))
+        # st_mtime - время последней модификации содержимого файла
+        timestamps.append(datetime.fromtimestamp(stat.st_mtime))
+        # st_birthtime - время создания файла (доступно на macOS и некоторых Linux FS)
+        if hasattr(stat, 'st_birthtime'):
+            timestamps.append(datetime.fromtimestamp(stat.st_birthtime))
+    except OSError as e:
+        logger.error(f"Ошибка получения временных меток файла для {file_path}: {e}")
+    
+    return timestamps
+
+
 def get_file_creation_time(file_path: Path) -> datetime:
     """
     Get file system creation time as fallback.
@@ -326,32 +357,60 @@ def get_file_creation_time(file_path: Path) -> datetime:
 
 def extract_metadata(file_path: Path) -> Dict[str, Any]:
     """
-    Extract metadata from media file (image or video).
+    Extract metadata from media file (image or video) with oldest date strategy.
     
     Краткое описание: Извлекает метаданные из медиафайла (изображение или видео).
-    Использует время создания файла из файловой системы как резервный вариант.
+    Собирает ВСЕ доступные временные метки и выбирает самую старую (самую раннюю по времени).
+    
+    Стратегия выбора самой старой даты:
+    - Гарантирует получение реальной даты съемки/создания, даже если файл был
+      недавно перемещен или модифицирован
+    - Сравнивает все доступные источники: EXIF datetime_original, EXIF datetime,
+      даты создания видео, временные метки файловой системы (st_ctime, st_mtime, st_birthtime)
+    - Выбирает самую раннюю дату как наиболее вероятную дату создания контента
 
     Args:
         file_path: Path to media file
 
     Returns:
-        Dictionary with metadata including datetime_original
+        Dictionary with metadata including datetime_original (oldest date found)
     """
     file_path = Path(file_path)
     suffix_lower = file_path.suffix.lower()
 
     metadata = {}
+    all_dates = []  # Список всех найденных дат для выбора самой старой
 
     # Извлечение метаданных в зависимости от типа файла
     if suffix_lower in IMAGE_EXTENSIONS:
         metadata = extract_image_metadata(file_path) or {}
+        # Добавляем все найденные даты из EXIF
+        if 'datetime_original' in metadata:
+            all_dates.append(metadata['datetime_original'])
+        if 'datetime' in metadata:
+            all_dates.append(metadata['datetime'])
     elif suffix_lower in VIDEO_EXTENSIONS:
         metadata = extract_video_metadata(file_path) or {}
+        # Добавляем дату создания видео, если найдена
+        if 'datetime_original' in metadata:
+            all_dates.append(metadata['datetime_original'])
 
-    # Резервный вариант: использование времени создания файла из файловой системы
-    if 'datetime_original' not in metadata:
-        metadata['datetime_original'] = get_file_creation_time(file_path)
-        logger.debug(f"Используется время создания файла из файловой системы для {file_path.name}")
+    # Добавление всех временных меток из файловой системы
+    filesystem_timestamps = get_all_file_timestamps(file_path)
+    all_dates.extend(filesystem_timestamps)
+
+    # Выбор самой старой (самой ранней) даты из всех найденных
+    if all_dates:
+        oldest_date = min(all_dates)
+        metadata['datetime_original'] = oldest_date
+        logger.debug(
+            f"Выбрана самая старая дата для {file_path.name}: {oldest_date.strftime('%Y-%m-%d %H:%M:%S')} "
+            f"(найдено {len(all_dates)} временных меток)"
+        )
+    else:
+        # Резервный вариант: использование текущего времени (крайне редкий случай)
+        metadata['datetime_original'] = datetime.now()
+        logger.warning(f"Не найдено ни одной временной метки для {file_path.name}, используется текущее время")
 
     return metadata
 

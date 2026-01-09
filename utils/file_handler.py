@@ -73,10 +73,14 @@ def ensure_directory(path: Path) -> None:
 
 def get_unique_filename(target_dir: Path, filename: str) -> Path:
     """
-    Generate unique filename if duplicate exists.
+    Generate unique filename if duplicate exists (synchronous check).
     
     Краткое описание: Генерирует уникальное имя файла, добавляя суффикс с номером,
     если файл с таким именем уже существует. Защищено от бесконечных циклов.
+    
+    ВАЖНО: Эта функция выполняется СИНХРОННО перед копированием/перемещением файла.
+    Проверка существования файла происходит ДО операции перемещения, что гарантирует
+    отсутствие конфликтов при синхронной обработке файлов.
 
     Args:
         target_dir: Target directory path
@@ -87,7 +91,8 @@ def get_unique_filename(target_dir: Path, filename: str) -> Path:
     """
     target_path = target_dir / filename
 
-    # Если файл не существует, возвращаем исходное имя
+    # СИНХРОННАЯ проверка: если файл не существует, возвращаем исходное имя
+    # Эта проверка выполняется ДО операции копирования/перемещения
     if not target_path.exists():
         return target_path
 
@@ -98,7 +103,8 @@ def get_unique_filename(target_dir: Path, filename: str) -> Path:
     # Максимальное количество попыток для предотвращения бесконечного цикла
     MAX_ATTEMPTS = 100000
 
-    # Поиск уникального имени путем добавления суффикса с номером
+    # СИНХРОННЫЙ поиск уникального имени: проверяем существование и инкрементируем индекс
+    # Только после нахождения уникального имени будет выполнена операция перемещения
     while target_path.exists() and counter < MAX_ATTEMPTS:
         new_name = f"{stem}_{counter}{suffix}"
         target_path = target_dir / new_name
@@ -115,10 +121,14 @@ def get_unique_filename(target_dir: Path, filename: str) -> Path:
 
 def move_file(media_file: MediaFile, verify_location: bool = True) -> bool:
     """
-    Move file from source to target location.
+    Move file from source to target location (synchronous operation).
     
     Краткое описание: Перемещает файл из исходного местоположения в целевое.
     Обеспечивает уникальность имени файла и создает директории при необходимости.
+    
+    ВАЖНО: Операция строго СИНХРОННАЯ. Используется shutil.rename() (через pathlib),
+    который блокирует выполнение до завершения перемещения. Никаких потоков,
+    процессов или асинхронных операций не используется.
 
     Args:
         media_file: MediaFile instance to move
@@ -142,12 +152,15 @@ def move_file(media_file: MediaFile, verify_location: bool = True) -> bool:
             if verify_location:
                 ensure_directory(media_file.target_path.parent)
 
-            # Обеспечение уникальности имени файла
+            # СИНХРОННАЯ проверка и обеспечение уникальности имени файла ПЕРЕД перемещением
+            # Функция get_unique_filename проверяет существование файла и инкрементирует индекс
+            # только после нахождения уникального имени выполняется операция перемещения
             media_file.target_path = get_unique_filename(
                 media_file.target_path.parent, media_file.target_path.name
             )
 
-            # Переименование (перемещение) файла
+            # СИНХРОННОЕ переименование (перемещение) файла
+            # pathlib.Path.rename() - блокирующая операция, программа ждет завершения
             media_file.source_path.rename(media_file.target_path)
             logger.info(f"Перемещено: {media_file.source_path} -> {media_file.target_path}")
             return True

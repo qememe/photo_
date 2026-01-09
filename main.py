@@ -22,7 +22,7 @@ from utils.metadata_extractor import (
     VIDEO_EXTENSIONS,
     extract_metadata,
 )
-from utils.report_generator import generate_reports_for_all_years
+from utils.report_generator import append_to_csv_report
 
 # Попытка импорта библиотеки rich для красивого вывода в терминале
 try:
@@ -281,16 +281,18 @@ def sort_media_files(
     show_progress: bool = True
 ) -> dict:
     """
-    Sort media files from source to destination by year.
+    Sort media files from source to destination by year (synchronous processing).
     
     Краткое описание: Сортирует медиафайлы из исходной директории в целевую по годам.
-    Поддерживает извлечение GPS-координат и отображение прогресса.
+    Обработка строго синхронная: каждый файл полностью копируется/перемещается,
+    его запись добавляется в CSV-отчет, и только затем начинается обработка следующего файла.
+    Никаких потоков, процессов или асинхронных операций не используется.
 
     Args:
         source_dir: Source directory
         destination_dir: Destination directory
         verify_location: Verify target location before moving (enables GPS extraction)
-        show_progress: Whether to show progress bar
+        show_progress: Whether to show progress messages
 
     Returns:
         Dictionary with statistics and list of moved media files
@@ -311,51 +313,38 @@ def sort_media_files(
     
     moved_files = []
 
-    # Перемещение файлов с индикатором прогресса
-    if show_progress and RICH_AVAILABLE:
-        console = Console()
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
-            TimeElapsedColumn(),
-            console=console
-        ) as progress:
-            task = progress.add_task("Перемещение файлов...", total=len(media_files))
-            for media_file in media_files:
-                try:
-                    # Генерация целевого пути на основе года
-                    target_path = generate_target_path(media_file, destination_dir)
-                    media_file.target_path = target_path
+    # Инициализация консоли для вывода прогресса
+    console = Console() if (show_progress and RICH_AVAILABLE) else None
 
-                    # Перемещение файла с проверкой местоположения (GPS)
-                    if move_file(media_file, verify_location):
-                        stats['moved'] += 1
-                        moved_files.append(media_file)
-                    else:
-                        stats['failed'] += 1
-                except Exception as e:
-                    logger.error(f"Ошибка сортировки {media_file.source_path}: {e}")
-                    stats['failed'] += 1
-                finally:
-                    progress.update(task, advance=1)
-    else:
-        # Перемещение файлов без индикатора прогресса
-        for media_file in media_files:
-            try:
-                target_path = generate_target_path(media_file, destination_dir)
-                media_file.target_path = target_path
-
-                if move_file(media_file, verify_location):
-                    stats['moved'] += 1
-                    moved_files.append(media_file)
+    # СИНХРОННАЯ обработка файлов: один за другим, без потоков/процессов/async
+    for index, media_file in enumerate(media_files, start=1):
+        try:
+            # Вывод прогресса: "Processing file X of Y..."
+            if show_progress:
+                progress_msg = f"Обработка файла {index} из {len(media_files)}: {media_file.source_path.name}"
+                if console:
+                    console.print(progress_msg, style="cyan")
                 else:
-                    stats['failed'] += 1
+                    safe_print(progress_msg)
 
-            except Exception as e:
-                logger.error(f"Ошибка сортировки {media_file.source_path}: {e}")
+            # Генерация целевого пути на основе года
+            target_path = generate_target_path(media_file, destination_dir)
+            media_file.target_path = target_path
+
+            # СИНХРОННОЕ перемещение файла (shutil операции блокирующие)
+            if move_file(media_file, verify_location):
+                stats['moved'] += 1
+                moved_files.append(media_file)
+                
+                # СИНХРОННАЯ запись в CSV-отчет сразу после успешного перемещения
+                # Программа ждет завершения записи перед переходом к следующему файлу
+                append_to_csv_report(media_file, include_location=verify_location)
+            else:
                 stats['failed'] += 1
+
+        except Exception as e:
+            logger.error(f"Ошибка сортировки {media_file.source_path}: {e}")
+            stats['failed'] += 1
 
     stats['moved_files'] = moved_files
     return stats
@@ -489,21 +478,9 @@ def main():
             safe_print("Операция отменена.")
         sys.exit(0)
 
-    # Выполнение сортировки
+    # Выполнение сортировки (синхронная обработка с инкрементальной записью в CSV)
+    # CSV-отчеты создаются инкрементально после каждого перемещенного файла
     stats = sort_media_files(source, destination, verify_location, show_progress=True)
-
-    # Генерация CSV-отчетов
-    if stats['moved'] > 0:
-        if RICH_AVAILABLE and console:
-            console.print("\nГенерация CSV-отчетов...", style="yellow")
-        else:
-            safe_print("\nГенерация CSV-отчетов...")
-        moved_files = stats.get('moved_files', [])
-        generate_reports_for_all_years(destination, moved_files, include_location=verify_location)
-        if RICH_AVAILABLE and console:
-            console.print("CSV-отчеты успешно сгенерированы.", style="bold green")
-        else:
-            safe_print("CSV-отчеты успешно сгенерированы.")
 
     # Вывод результатов
     if RICH_AVAILABLE and console:
