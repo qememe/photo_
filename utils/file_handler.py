@@ -2,6 +2,7 @@
 
 import logging
 import shutil
+import time
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -242,10 +243,24 @@ def move_file(media_file: MediaFile, verify_location: bool = True) -> Tuple[bool
 
             # БЫСТРОЕ ПЕРЕМЕЩЕНИЕ: используем shutil.move() для мгновенного перемещения на одном диске
             # Это НЕ перезаписывает существующие файлы (проверка выше уже выполнена)
-            shutil.move(str(media_file.source_path), str(media_file.target_path))
+            # Add retry logic for locked files (OS indexer might be accessing the file)
+            max_retries = 3
+            retry_delay = 0.1  # 100ms delay between retries
             
-            logger.info(f"Перемещено: {media_file.source_path} -> {media_file.target_path}")
-            return (True, False)
+            for attempt in range(max_retries):
+                try:
+                    shutil.move(str(media_file.source_path), str(media_file.target_path))
+                    logger.info(f"Перемещено: {media_file.source_path} -> {media_file.target_path}")
+                    return (True, False)
+                except (PermissionError, OSError) as e:
+                    # File might be locked by OS indexer or another process
+                    if attempt < max_retries - 1:
+                        logger.debug(f"Файл заблокирован, повторная попытка {attempt + 1}/{max_retries}: {media_file.source_path.name}")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                    else:
+                        # Last attempt failed, raise the error
+                        raise
 
     except (PermissionError, FileExistsError, OSError) as e:
         logger.error(f"Не удалось переместить {media_file.source_path}: {e}")
@@ -337,6 +352,10 @@ def get_target_path(media_file: MediaFile, destination: Path, iphone_mode: bool 
     извлеченного из метаданных. Если iPhone Mode включен, сортирует только файлы
     с Apple устройств по годам, остальные перемещает в Unknown_Year/Other_Devices/.
     Если iPhone Mode выключен, использует стандартную логику сортировки по годам.
+    
+    CRITICAL: Before moving, double-check that target year is not 2026 if an earlier
+    date was found in metadata (2004-2025). If metadata shows 2004-2025, it MUST
+    override system mtime/ctime (2026).
 
     Args:
         media_file: MediaFile instance
@@ -352,21 +371,67 @@ def get_target_path(media_file: MediaFile, destination: Path, iphone_mode: bool 
         make = media_file.metadata.get('make', '').strip()
         is_apple = make.lower() == 'apple'
         
+        # Check if filename starts with "IMG_" (classic Apple format)
+        filename_starts_with_img = media_file.source_path.name.startswith('IMG_')
+        
+        # Check file extension for Apple formats
+        suffix_lower = media_file.source_path.suffix.lower()
+        is_apple_format = suffix_lower in ('.mov', '.mp4', '.m4v', '.heic', '.heif')
+        
+        # Enhanced Apple detection: check metadata for Apple identifiers
+        if not is_apple:
+            # Check if MediaInfo/Hachoir detected Apple device (iPhone 6s, etc.)
+            # This is detected in extract_metadata_with_hachoir
+            if is_apple_format or filename_starts_with_img:
+                # Treat as potential Apple device
+                is_apple = True
+        
         # Safety: PNG files or screenshots without Apple metadata go to Unknown_Year
         # Also check file extension for PNG
-        is_png = media_file.source_path.suffix.lower() == '.png'
+        is_png = suffix_lower == '.png'
         
-        # If not Apple device, or PNG without Apple metadata -> go to Other_Devices
-        if not is_apple:
+        # If not Apple device and filename doesn't start with IMG_, go to Other_Devices
+        if not is_apple and not filename_starts_with_img:
             # Non-Apple devices go to Unknown_Year/Other_Devices/
             target_dir = destination / "Unknown_Year" / "Other_Devices"
             target_path = target_dir / media_file.source_path.name
             return target_path
+        
+        # If filename starts with IMG_ but metadata is empty (no date found)
+        # Treat as Apple device but move to Unknown_Year/Needs_Manual_Check
+        if filename_starts_with_img or is_apple:
+            best_dt = media_file.get_earliest_timestamp()
+            if not best_dt:
+                # Apple device (IMG_ prefix or Apple format) but no date found -> Needs_Manual_Check
+                target_dir = destination / "Unknown_Year" / "Needs_Manual_Check"
+                target_path = target_dir / media_file.source_path.name
+                logger.info(f"iPhone Mode: Apple device file with empty metadata -> Needs_Manual_Check: {media_file.source_path.name}")
+                return target_path
     
     # Standard logic: Extract year from metadata
     best_dt = media_file.get_earliest_timestamp()
+    current_year = datetime.now().year
+    
     if best_dt:
         year = best_dt.year
+        
+        # STRICT FUTURE DATE BAN: Never allow files to be sorted into future years
+        # Move such files to Unknown_Year instead
+        if year > current_year or year >= 2026:
+            logger.warning(f"Future/invalid date detected ({year}), moving to Unknown_Year: {media_file.source_path.name}")
+            target_year_folder = "Unknown_Year"
+            target_dir = destination / target_year_folder
+            target_path = target_dir / media_file.source_path.name
+            return target_path
+        
+        # CRITICAL SAFETY CHECK: If metadata shows 2004-2025, it MUST override system mtime/ctime (2026)
+        if year == 2026:
+            # Check if there's a metadata date that's earlier (2004-2025)
+            if 'datetime_original' in media_file.metadata:
+                meta_date = media_file.metadata['datetime_original']
+                if isinstance(meta_date, datetime) and 2004 <= meta_date.year <= 2025:
+                    logger.warning(f"System date is 2026, but metadata shows {meta_date.year}. Using metadata year: {meta_date.year}")
+                    year = meta_date.year
     else:
         year = None
     

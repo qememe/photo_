@@ -58,6 +58,14 @@ if errorlevel 1 (
     echo Warning: Failed to install hachoir. Video metadata extraction may be limited.
 )
 
+REM Install pymediainfo and python-dateutil for MOV/MP4 metadata extraction
+echo Installing pymediainfo and python-dateutil for video metadata support...
+pip install --no-cache-dir --upgrade pymediainfo python-dateutil
+if errorlevel 1 (
+    echo Warning: Failed to install pymediainfo/python-dateutil. Video metadata extraction may be limited.
+)
+echo Note: MediaInfo requires MediaInfo.dll on Windows. Ensure MediaInfo is installed on the system or the .dll is in the path.
+
 echo.
 echo ==========================================
 echo Installation complete!

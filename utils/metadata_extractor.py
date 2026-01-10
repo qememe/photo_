@@ -48,6 +48,20 @@ except ImportError:
     extractMetadata = None
     HACHOIR_AVAILABLE = False
 
+try:
+    from pymediainfo import MediaInfo
+    PYMEDIAINFO_AVAILABLE = True
+except ImportError:
+    MediaInfo = None
+    PYMEDIAINFO_AVAILABLE = False
+
+try:
+    from dateutil import parser as dateutil_parser
+    DATEUTIL_AVAILABLE = True
+except ImportError:
+    dateutil_parser = None
+    DATEUTIL_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 # Supported image formats
@@ -59,54 +73,110 @@ HACHOIR_FORMATS = ('.mov', '.mp4', '.heic', '.heif', '.m4v')
 
 # Date validation constants
 MIN_DATE = datetime(2004, 1, 1)
+# STRICT: Maximum valid year is 2025 (not current year, not 2026)
+MAX_VALID_YEAR = 2025
+# Invalid dates to discard (common Unix/QuickTime bugs)
+INVALID_YEARS = (1904, 1970)
 
-def get_max_valid_year() -> int:
+
+def is_valid_year(year: int) -> bool:
     """
-    Get maximum valid year for date validation.
+    STRICT year validator. Returns True only if year is between 2004 and 2025.
     
-    Returns current year + 1, but if current year is before 2026,
-    dates in 2026 or later are treated as invalid.
+    CRITICAL: If year >= 2026 (or current year), it is a FALSE positive.
+    This prevents system stat dates (mtime/ctime) from overriding real metadata.
     
+    Args:
+        year: Year to validate
+        
     Returns:
-        Maximum valid year (current year + 1, or current year if before 2026)
+        True if 2004 <= year <= 2025, False otherwise
     """
-    current_year = datetime.now().year
-    # If we're before 2026, reject 2026+ dates
-    if current_year < 2026:
-        return current_year
-    # Otherwise, allow current year + 1
-    return current_year + 1
+    if year is None:
+        return False
+    if year in INVALID_YEARS:
+        return False
+    if year < 2004:
+        return False
+    if year > MAX_VALID_YEAR:
+        return False
+    return True
+
+
+def get_date_from_filename(filename: str) -> Optional[datetime]:
+    """
+    Extract date from filename using regex patterns.
+    
+    Looks for common patterns:
+    - IMG_20210818_... (Apple format)
+    - 2021-08-18... (ISO format)
+    - WhatsApp Video 2021-08-18...
+    - YYYYMMDD or YYYY-MM-DD patterns
+    
+    Args:
+        filename: Filename to parse
+        
+    Returns:
+        datetime object if valid date found (2004-2025), None otherwise
+    """
+    # Pattern 1: IMG_YYYYMMDD_... (Apple format)
+    pattern1 = r'IMG_(\d{4})(\d{2})(\d{2})'
+    match = re.search(pattern1, filename)
+    if match:
+        try:
+            year, month, day = int(match.group(1)), int(match.group(2)), int(match.group(3))
+            if is_valid_year(year) and 1 <= month <= 12 and 1 <= day <= 31:
+                parsed_date = datetime(year, month, day)
+                if parsed_date >= MIN_DATE:
+                    logger.debug(f"Date found in filename (IMG_ pattern): {parsed_date} from {filename}")
+                    return parsed_date
+        except (ValueError, TypeError):
+            pass
+    
+    # Pattern 2: YYYY-MM-DD (ISO format)
+    pattern2 = r'(\d{4})-(\d{2})-(\d{2})'
+    match = re.search(pattern2, filename)
+    if match:
+        try:
+            year, month, day = int(match.group(1)), int(match.group(2)), int(match.group(3))
+            if is_valid_year(year) and 1 <= month <= 12 and 1 <= day <= 31:
+                parsed_date = datetime(year, month, day)
+                if parsed_date >= MIN_DATE:
+                    logger.debug(f"Date found in filename (YYYY-MM-DD pattern): {parsed_date} from {filename}")
+                    return parsed_date
+        except (ValueError, TypeError):
+            pass
+    
+    # Pattern 3: YYYYMMDD (no separators)
+    pattern3 = r'(\d{4})(\d{2})(\d{2})'
+    match = re.search(pattern3, filename)
+    if match:
+        try:
+            year, month, day = int(match.group(1)), int(match.group(2)), int(match.group(3))
+            if is_valid_year(year) and 1 <= month <= 12 and 1 <= day <= 31:
+                parsed_date = datetime(year, month, day)
+                if parsed_date >= MIN_DATE:
+                    logger.debug(f"Date found in filename (YYYYMMDD pattern): {parsed_date} from {filename}")
+                    return parsed_date
+        except (ValueError, TypeError):
+            pass
+    
+    return None
 
 
 def convert_gps_coordinates(gps_latitude: tuple, gps_longitude: tuple, 
                             latitude_ref: str, longitude_ref: str) -> Optional[Tuple[float, float]]:
     """
     Convert GPS coordinates from EXIF format to Decimal Degrees.
-    
-    Краткое описание: Преобразует GPS-координаты из формата EXIF (градусы, минуты, секунды)
-    в десятичные градусы с учетом направления (N/S, E/W).
-
-    Args:
-        gps_latitude: Tuple of (degrees, minutes, seconds) for latitude
-        gps_longitude: Tuple of (degrees, minutes, seconds) for longitude
-        latitude_ref: Reference direction ('N' or 'S')
-        longitude_ref: Reference direction ('E' or 'W')
-
-    Returns:
-        Tuple of (latitude, longitude) in Decimal Degrees, or None if conversion fails
     """
     try:
-        # Преобразование широты из формата градусы/минуты/секунды в десятичные градусы
         lat_deg, lat_min, lat_sec = gps_latitude
         latitude = lat_deg + (lat_min / 60.0) + (lat_sec / 3600.0)
-        # Отрицательное значение для южного полушария
         if latitude_ref.upper() == 'S':
             latitude = -latitude
 
-        # Преобразование долготы из формата градусы/минуты/секунды в десятичные градусы
         lon_deg, lon_min, lon_sec = gps_longitude
         longitude = lon_deg + (lon_min / 60.0) + (lon_sec / 3600.0)
-        # Отрицательное значение для западного полушария
         if longitude_ref.upper() == 'W':
             longitude = -longitude
 
@@ -117,44 +187,154 @@ def convert_gps_coordinates(gps_latitude: tuple, gps_longitude: tuple,
 
 
 def extract_gps_from_image(exif_image: ExifImage) -> Optional[Tuple[float, float]]:
-    """
-    Extract GPS coordinates from EXIF image.
-    
-    Краткое описание: Извлекает GPS-координаты из EXIF-данных изображения
-    и преобразует их в формат десятичных градусов.
-
-    Args:
-        exif_image: ExifImage object
-
-    Returns:
-        Tuple of (latitude, longitude) in Decimal Degrees, or None
-    """
+    """Extract GPS coordinates from EXIF image."""
     try:
-        # Проверка наличия GPS-данных в EXIF
         if not hasattr(exif_image, 'gps_latitude') or not hasattr(exif_image, 'gps_longitude'):
             return None
-
-        # Извлечение координат и направлений
         gps_latitude = exif_image.gps_latitude
         gps_longitude = exif_image.gps_longitude
         latitude_ref = getattr(exif_image, 'gps_latitude_ref', 'N')
         longitude_ref = getattr(exif_image, 'gps_longitude_ref', 'E')
-
-        # Преобразование в десятичные градусы
         return convert_gps_coordinates(gps_latitude, gps_longitude, latitude_ref, longitude_ref)
     except Exception as e:
         logger.debug(f"Ошибка извлечения GPS из изображения: {e}")
         return None
 
 
-def extract_metadata_with_hachoir(file_path: Path) -> Optional[Dict[str, Any]]:
+def _parse_mediainfo_date(date_str: str) -> Optional[datetime]:
     """
-    Extract metadata from file using hachoir (for MOV/MP4/HEIC and TiffByteOrder errors).
+    Parse date string from MediaInfo using dateutil.parser or regex fallback.
     
-    Краткое описание: Извлекает метаданные из файла с помощью hachoir.
-    Используется для видео (MOV/MP4) и HEIC файлов, а также для файлов с ошибками TiffByteOrder.
-    Определяет Apple устройства по метаданным.
-    CRITICAL: QuickTime (Apple) dates are often stored in UTC. Converts to simple year.
+    Args:
+        date_str: Date string from MediaInfo (e.g., "2017-11-02T09:48:07+0300")
+        
+    Returns:
+        datetime object or None if parsing fails
+    """
+    if not date_str:
+        return None
+    
+    # Try dateutil.parser first (handles ISO 8601 with timezones)
+    if DATEUTIL_AVAILABLE:
+        try:
+            parsed = dateutil_parser.parse(date_str)
+            return parsed
+        except (ValueError, TypeError, AttributeError):
+            pass
+    
+    # Fallback: manual parsing for common formats
+    date_str_clean = str(date_str).strip()
+    
+    # Remove timezone suffixes like Z, +00:00, -05:00, +0300
+    if date_str_clean.endswith('Z'):
+        date_str_clean = date_str_clean[:-1]
+    
+    # Handle timezone offsets
+    if '+' in date_str_clean:
+        date_str_clean = date_str_clean.split('+')[0]
+    elif 'T' in date_str_clean and date_str_clean.count('-') > 2:
+        # Format: YYYY-MM-DDTHH:MM:SS-XX:XX
+        parts = date_str_clean.split('T')
+        if len(parts) == 2:
+            time_part = parts[1]
+            # Remove timezone offset from time part
+            if '-' in time_part:
+                time_part = time_part.split('-')[0]
+            date_str_clean = f"{parts[0]}T{time_part}"
+    
+    # Try multiple date formats
+    formats = [
+        '%Y-%m-%dT%H:%M:%S',
+        '%Y-%m-%d %H:%M:%S',
+        '%Y-%m-%d',
+        '%Y:%m:%d %H:%M:%S',
+        '%Y/%m/%d %H:%M:%S',
+        '%Y-%m-%dT%H:%M:%S.%f',
+        '%Y-%m-%d %H:%M:%S.%f'
+    ]
+    
+    for fmt in formats:
+        try:
+            return datetime.strptime(date_str_clean, fmt)
+        except ValueError:
+            continue
+    
+    return None
+
+
+def _extract_apple_creationdate_binary(file_path: Path) -> Optional[datetime]:
+    """
+    Binary regex fallback: Search for com.apple.quicktime.creationdate in raw bytes.
+    
+    This is the NUCLEAR option when pymediainfo fails to parse the tag properly.
+    
+    CRITICAL: QuickTime files store metadata in the 'moov' atom which can be at the
+    START or END of the file. We scan BOTH locations.
+    
+    Pattern: ISO date YYYY-MM-DDTHH:MM:SS near 'creationdate' tag.
+    
+    Args:
+        file_path: Path to video file
+        
+    Returns:
+        datetime object or None
+    """
+    import os
+    
+    def search_in_data(data: bytes, source: str) -> Optional[datetime]:
+        """Search for creation date in binary data."""
+        # Pattern 1: ISO date format YYYY-MM-DDTHH:MM:SS
+        pattern = rb'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})'
+        matches = re.findall(pattern, data)
+        
+        for match in matches:
+            date_str = match.decode('utf-8', errors='ignore')
+            parsed = _parse_mediainfo_date(date_str)
+            if parsed and is_valid_year(parsed.year):
+                logger.info(f"[BINARY REGEX] Found ISO date in {source}: {parsed} from {file_path.name}")
+                return parsed
+        
+        return None
+    
+    try:
+        file_size = os.path.getsize(str(file_path))
+        
+        # Strategy 1: Read first 5MB (metadata at start)
+        with open(file_path, 'rb') as f:
+            header_data = f.read(5 * 1024 * 1024)
+        
+        result = search_in_data(header_data, "header")
+        if result:
+            return result
+        
+        # Strategy 2: Read last 15MB (metadata at end - common for QuickTime)
+        # This is where Apple stores the moov atom for large files
+        if file_size > 15 * 1024 * 1024:
+            with open(file_path, 'rb') as f:
+                f.seek(max(0, file_size - 15 * 1024 * 1024))
+                tail_data = f.read()
+            
+            result = search_in_data(tail_data, "tail")
+            if result:
+                return result
+        
+        return None
+    except Exception as e:
+        logger.debug(f"Binary regex scan failed for {file_path}: {e}")
+        return None
+
+
+def extract_metadata_with_pymediainfo(file_path: Path) -> Optional[Dict[str, Any]]:
+    """
+    Extract metadata from file using pymediainfo (PRIMARY tool for MOV/MP4).
+    
+    PRIORITY ORDER:
+    1. comapplequicktimecreationdate (com.apple.quicktime.creationdate)
+    2. encoded_date
+    3. tagged_date
+    4. Any other date field
+    
+    STRICT: Rejects any year >= 2026 or < 2004. Returns None to force Unknown_Year.
     
     Args:
         file_path: Path to media file
@@ -162,10 +342,118 @@ def extract_metadata_with_hachoir(file_path: Path) -> Optional[Dict[str, Any]]:
     Returns:
         Dictionary with metadata or None if extraction fails or date is invalid
     """
+    metadata = {}
+    is_apple_device = False
+    
+    # Try pymediainfo first
+    if PYMEDIAINFO_AVAILABLE:
+        try:
+            media_info = MediaInfo.parse(str(file_path))
+            if media_info:
+                best_date = None
+                tag_used = None
+                
+                for track in media_info.tracks:
+                    # PRIORITY 1: comapplequicktimecreationdate (THE KEY TAG)
+                    if not best_date:
+                        for attr_name in ['comapplequicktimecreationdate', 'com_apple_quicktime_creationdate']:
+                            date_str = getattr(track, attr_name, None)
+                            if date_str:
+                                parsed_date = _parse_mediainfo_date(str(date_str))
+                                if parsed_date and is_valid_year(parsed_date.year):
+                                    best_date = parsed_date
+                                    tag_used = attr_name
+                                    logger.info(f"[PYMEDIAINFO] comapplequicktimecreationdate: {parsed_date.year} from {file_path.name}")
+                                    break
+                    
+                    # PRIORITY 2: encoded_date
+                    if not best_date:
+                        date_str = getattr(track, 'encoded_date', None)
+                        if date_str:
+                            # Skip "UTC" only strings
+                            if str(date_str).strip().upper() == 'UTC':
+                                continue
+                            parsed_date = _parse_mediainfo_date(str(date_str))
+                            if parsed_date and is_valid_year(parsed_date.year):
+                                best_date = parsed_date
+                                tag_used = 'encoded_date'
+                                logger.info(f"[PYMEDIAINFO] encoded_date: {parsed_date.year} from {file_path.name}")
+                    
+                    # PRIORITY 3: tagged_date
+                    if not best_date:
+                        date_str = getattr(track, 'tagged_date', None)
+                        if date_str:
+                            if str(date_str).strip().upper() == 'UTC':
+                                continue
+                            parsed_date = _parse_mediainfo_date(str(date_str))
+                            if parsed_date and is_valid_year(parsed_date.year):
+                                best_date = parsed_date
+                                tag_used = 'tagged_date'
+                                logger.info(f"[PYMEDIAINFO] tagged_date: {parsed_date.year} from {file_path.name}")
+                    
+                    # PRIORITY 4: Any date-related attribute
+                    if not best_date:
+                        for attr_name in dir(track):
+                            if 'date' in attr_name.lower() and not attr_name.startswith('_'):
+                                try:
+                                    date_str = getattr(track, attr_name, None)
+                                    if date_str and isinstance(date_str, str):
+                                        if date_str.strip().upper() == 'UTC':
+                                            continue
+                                        parsed_date = _parse_mediainfo_date(date_str)
+                                        if parsed_date and is_valid_year(parsed_date.year):
+                                            best_date = parsed_date
+                                            tag_used = attr_name
+                                            logger.info(f"[PYMEDIAINFO] {attr_name}: {parsed_date.year} from {file_path.name}")
+                                            break
+                                except (AttributeError, TypeError):
+                                    continue
+                    
+                    if best_date:
+                        break
+                
+                # Check for Apple device indicators
+                for track in media_info.tracks:
+                    for attr in ['make', 'comapplequicktimemake', 'com_apple_quicktime_make']:
+                        make_value = getattr(track, attr, None)
+                        if make_value and 'apple' in str(make_value).lower():
+                            is_apple_device = True
+                            metadata['make'] = 'Apple'
+                            break
+                    
+                    model_value = getattr(track, 'model', None) or getattr(track, 'comapplequicktimemodel', None)
+                    if model_value:
+                        model_str = str(model_value).lower()
+                        if any(x in model_str for x in ['iphone', 'ipad', 'ipod']):
+                            is_apple_device = True
+                            metadata['make'] = 'Apple'
+                
+                if best_date:
+                    metadata['datetime_original'] = best_date
+                    if is_apple_device:
+                        metadata['make'] = 'Apple'
+                    return metadata
+                    
+        except Exception as e:
+            logger.debug(f"pymediainfo parse failed for {file_path}: {e}")
+    
+    # FALLBACK: Binary regex search for com.apple.quicktime.creationdate
+    binary_date = _extract_apple_creationdate_binary(file_path)
+    if binary_date:
+        metadata['datetime_original'] = binary_date
+        metadata['make'] = 'Apple'  # If we found Apple tag, it's Apple device
+        return metadata
+    
+    return None
+
+
+def extract_metadata_with_hachoir(file_path: Path) -> Optional[Dict[str, Any]]:
+    """
+    Extract metadata from file using hachoir (fallback for HEIC/HEIF).
+    """
     if not HACHOIR_AVAILABLE:
         return None
     
-    MAX_YEAR = get_max_valid_year()
     metadata = {}
     is_apple_device = False
     
@@ -174,128 +462,42 @@ def extract_metadata_with_hachoir(file_path: Path) -> Optional[Dict[str, Any]]:
         if not parser:
             return None
         
-        # Use parser as context manager
         with parser:
             hachoir_metadata = extractMetadata(parser)
             if not hachoir_metadata:
                 return None
         
-            # Extract creation date - hachoir metadata has various date attributes
             creation_date = None
-            # Try different date attributes that hachoir might provide
-            for attr in ['creation_date', 'date', 'date_creation', 'creation_time', 'creation-date']:
+            
+            # Try direct attributes
+            for attr in ['creation_date', 'date', 'date_creation', 'creation_time']:
                 if hasattr(hachoir_metadata, attr):
                     try:
-                        creation_date = getattr(hachoir_metadata, attr)
-                        if creation_date:
-                            break
+                        value = getattr(hachoir_metadata, attr)
+                        if value:
+                            if isinstance(value, datetime):
+                                if is_valid_year(value.year):
+                                    creation_date = value
+                                    break
+                            else:
+                                parsed = _parse_mediainfo_date(str(value))
+                                if parsed and is_valid_year(parsed.year):
+                                    creation_date = parsed
+                                    break
                     except (AttributeError, TypeError):
                         continue
             
-            # Also try iterating through all metadata items for video files
-            if not creation_date:
-                try:
-                    # hachoir metadata can be accessed as dictionary-like object
-                    for key in hachoir_metadata:
-                        key_lower = str(key).lower()
-                        if any(term in key_lower for term in ['creation', 'date', 'time']):
-                            try:
-                                value = hachoir_metadata.get(key)
-                                if value:
-                                    creation_date = value
-                                    break
-                            except (AttributeError, TypeError):
-                                continue
-                except (AttributeError, TypeError):
-                    pass
-            
             if creation_date:
-                try:
-                    # hachoir may return datetime objects or strings
-                    if isinstance(creation_date, datetime):
-                        parsed_date = creation_date
-                    else:
-                        # Try to parse string dates
-                        date_str = str(creation_date)
-                        # QuickTime dates often have UTC timezone info - strip it
-                        # Remove timezone suffixes like Z, +00:00, -05:00
-                        date_str_clean = date_str.rstrip('Z').split('+')[0].split('-')[0] if '-' in date_str and date_str.count('-') > 2 else date_str.rstrip('Z')
-                        if date_str_clean.count('-') > 2:  # Has timezone offset
-                            # Find T separator and take everything before timezone
-                            if 'T' in date_str_clean:
-                                parts = date_str_clean.split('T')
-                                if len(parts) == 2:
-                                    time_part = parts[1]
-                                    # Remove timezone offset (format: HH:MM:SS-XX:XX or HH:MM:SS+XX:XX)
-                                    if ('-' in time_part or '+' in time_part) and time_part.count(':') > 2:
-                                        time_part = ':'.join(time_part.split(':')[:3])  # Take first 3 parts (HH:MM:SS)
-                                    date_str_clean = f"{parts[0]}T{time_part}"
-                        
-                        # Try multiple date formats
-                        formats = [
-                            '%Y-%m-%d %H:%M:%S',
-                            '%Y-%m-%dT%H:%M:%S',
-                            '%Y-%m-%d',
-                            '%Y:%m:%d %H:%M:%S',
-                            '%Y/%m/%d %H:%M:%S',
-                            '%Y-%m-%d %H:%M:%S.%f',
-                            '%Y-%m-%dT%H:%M:%S.%f'
-                        ]
-                        parsed_date = None
-                        for fmt in formats:
-                            try:
-                                parsed_date = datetime.strptime(date_str_clean, fmt)
-                                break
-                            except ValueError:
-                                continue
-                    
-                    if parsed_date:
-                        # CRITICAL: Filter dates - before 2004 or after MAX_YEAR -> discard
-                        # If date is in 2026+ and we're before 2026, treat as invalid
-                        if parsed_date >= MIN_DATE and parsed_date.year <= MAX_YEAR:
-                            metadata['datetime_original'] = parsed_date
-                            logger.debug(f"Hachoir extracted date: {parsed_date} from {file_path.name}")
-                        else:
-                            logger.debug(f"Hachoir date rejected (out of range): {parsed_date} from {file_path.name}")
-                except (ValueError, TypeError, AttributeError) as e:
-                    logger.debug(f"Hachoir date parsing error: {e}")
+                metadata['datetime_original'] = creation_date
+                logger.info(f"[HACHOIR] creation_date: {creation_date.year} from {file_path.name}")
             
-            # Check for Apple device indicators
-            # HEIC files are typically from Apple devices
+            # Check for Apple device
             suffix_lower = file_path.suffix.lower()
             if suffix_lower in ('.heic', '.heif', '.mov', '.m4v'):
                 is_apple_device = True
             
-            # Check metadata for Apple identifiers
-            for attr in ['producer', 'author', 'comment', 'software', 'encoder', 'com.apple.quicktime.make']:
-                if hasattr(hachoir_metadata, attr):
-                    try:
-                        value = str(getattr(hachoir_metadata, attr)).lower()
-                        if 'apple' in value or 'iphone' in value or 'ipad' in value:
-                            is_apple_device = True
-                            break
-                    except (AttributeError, TypeError):
-                        continue
-            
-            # Also check metadata dictionary for Apple identifiers
-            try:
-                for key in hachoir_metadata:
-                    key_str = str(key).lower()
-                    if 'apple' in key_str or 'make' in key_str:
-                        try:
-                            value = str(hachoir_metadata.get(key)).lower()
-                            if 'apple' in value:
-                                is_apple_device = True
-                                break
-                        except (AttributeError, TypeError):
-                            continue
-            except (AttributeError, TypeError):
-                pass
-            
-            # Set make to Apple if detected
             if is_apple_device:
                 metadata['make'] = 'Apple'
-                logger.debug(f"Hachoir detected Apple device for {file_path.name}")
         
         return metadata if metadata else None
         
@@ -305,49 +507,35 @@ def extract_metadata_with_hachoir(file_path: Path) -> Optional[Dict[str, Any]]:
 
 
 def extract_image_metadata_with_pillow(file_path: Path) -> Optional[Dict[str, Any]]:
-    """
-    Extract metadata from image using Pillow as fallback.
-    
-    Args:
-        file_path: Path to image file
-        
-    Returns:
-        Dictionary with metadata or None if extraction fails or date is invalid
-    """
+    """Extract metadata from image using Pillow as fallback."""
     if not PILLOW_AVAILABLE:
         return None
-    
-    # Порог 2004-01-01 для фильтрации системных значений по умолчанию
-    # Динамический фильтр дат: защита от дат в будущем (2026+ если мы до 2026)
-    MAX_YEAR = get_max_valid_year()
     
     try:
         with PILImage.open(file_path) as img:
             metadata = {}
             
-            # Проверка img.info для строк типа 'creation_time' или 'date:create'
+            # Check img.info
             if hasattr(img, 'info') and img.info:
                 for key, value in img.info.items():
                     if isinstance(key, str) and isinstance(value, str):
                         key_lower = key.lower()
-                        # Проверка на ключи, связанные с датой создания
                         if any(term in key_lower for term in ['creation_time', 'date:create', 'date', 'time']):
                             try:
-                                # Попытка парсинга различных форматов даты
                                 for fmt in ['%Y:%m:%d %H:%M:%S', '%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%d']:
                                     try:
                                         parsed_date = datetime.strptime(str(value), fmt)
-                                        # Filter: before 2004 or after 2026 -> discard
-                                        if parsed_date >= MIN_DATE and parsed_date.year <= MAX_YEAR:
+                                        if is_valid_year(parsed_date.year):
                                             if 'datetime_original' not in metadata:
                                                 metadata['datetime_original'] = parsed_date
+                                                logger.info(f"Date found via: Pillow (img.info) - {parsed_date} from {file_path.name}")
                                             break
                                     except ValueError:
                                         continue
                             except (ValueError, TypeError, AttributeError):
                                 pass
             
-            # Проверка img.getexif() если доступно
+            # Check img.getexif()
             try:
                 exifdata = img.getexif()
                 if exifdata:
@@ -355,21 +543,15 @@ def extract_image_metadata_with_pillow(file_path: Path) -> Optional[Dict[str, An
                         tag = TAGS.get(tag_id, tag_id)
                         if tag == 'DateTimeOriginal' and value:
                             try:
-                                parsed_date = datetime.strptime(
-                                    str(value), '%Y:%m:%d %H:%M:%S'
-                                )
-                                # Filter: before 2004 or after 2026 -> discard
-                                if parsed_date >= MIN_DATE and parsed_date.year <= MAX_YEAR:
+                                parsed_date = datetime.strptime(str(value), '%Y:%m:%d %H:%M:%S')
+                                if is_valid_year(parsed_date.year):
                                     metadata['datetime_original'] = parsed_date
                             except (ValueError, TypeError):
                                 pass
                         elif tag == 'DateTime' and value and 'datetime_original' not in metadata:
                             try:
-                                parsed_date = datetime.strptime(
-                                    str(value), '%Y:%m:%d %H:%M:%S'
-                                )
-                                # Filter: before 2004 or after 2026 -> discard
-                                if parsed_date >= MIN_DATE and parsed_date.year <= MAX_YEAR:
+                                parsed_date = datetime.strptime(str(value), '%Y:%m:%d %H:%M:%S')
+                                if is_valid_year(parsed_date.year):
                                     metadata['datetime'] = parsed_date
                             except (ValueError, TypeError):
                                 pass
@@ -379,7 +561,6 @@ def extract_image_metadata_with_pillow(file_path: Path) -> Optional[Dict[str, An
                             except (ValueError, TypeError):
                                 pass
             except (AttributeError, Exception):
-                # getexif() может быть недоступен или вызвать ошибку
                 pass
             
             return metadata if metadata else None
@@ -392,73 +573,51 @@ def extract_image_metadata(file_path: Path) -> Optional[Dict[str, Any]]:
     """
     Extract EXIF metadata from image file with robust error handling.
     
-    Проверка на 2004 год и уход от использования текущей даты.
-    Обновлен фильтр дат: теперь разрешен 2026 год для актуальных файлов.
-    
-    Краткое описание: Извлекает EXIF-метаданные из файла изображения,
-    включая дату/время создания и GPS-координаты. Использует строгую иерархию:
-    1. EXIF (для JPG) - библиотека exif (PNG файлы обходят эту библиотеку)
-    2. Pillow (для PNG и fallback) - проверка img.info и img.getexif()
-    3. Системные статистики (финальный fallback) - минимальное из getmtime/getctime
-    Если дата найдена, но вне диапазона 2004-2026, она отбрасывается.
-
-    Args:
-        file_path: Path to image file
-
-    Returns:
-        Dictionary with metadata or None if extraction fails or date is before 2004
+    Extraction priority:
+    1. EXIF (for JPG)
+    2. Pillow (for PNG and fallback)
+    3. Filename parsing
+    4. XMP Brute Force
+    5. System stats (ONLY if valid year 2004-2025)
     """
-    # Порог 2004-01-01 для фильтрации системных значений по умолчанию
-    # Динамический фильтр дат: защита от дат в будущем (2026+ если мы до 2026)
-    MAX_YEAR = get_max_valid_year()
     metadata = {}
     
-    # PNG файлы обходят библиотеку exif для предотвращения ошибок TiffByteOrder
     suffix_lower = file_path.suffix.lower()
     skip_exif = (suffix_lower == '.png')
     
-    # Log PNG skip as INFO, not ERROR
     if skip_exif:
-        logger.info(f"PNG file detected, skipping EXIF, using Pillow/System stats: {file_path.name}")
+        logger.info(f"PNG file detected, skipping EXIF: {file_path.name}")
     
-    # Шаг 1: Попытка извлечения через библиотеку exif (для JPG, не для PNG)
+    # Step 1: EXIF extraction (for JPG, not PNG)
     if ExifImage and not skip_exif:
         try:
             with open(file_path, 'rb') as image_file:
                 exif_image = ExifImage(image_file)
 
             if exif_image.has_exif:
-                # Extract datetime_original
                 if hasattr(exif_image, 'datetime_original'):
                     try:
                         dt_str = exif_image.datetime_original
                         parsed_date = datetime.strptime(dt_str, '%Y:%m:%d %H:%M:%S')
-                        # Filter: before 2004 or after 2026 -> discard
-                        if parsed_date >= MIN_DATE and parsed_date.year <= MAX_YEAR:
+                        if is_valid_year(parsed_date.year):
+                            metadata['datetime_original'] = parsed_date
+                            logger.info(f"Date found via: EXIF - {parsed_date} from {file_path.name}")
+                    except (ValueError, AttributeError):
+                        pass
+
+                if hasattr(exif_image, 'datetime') and 'datetime_original' not in metadata:
+                    try:
+                        dt_str = exif_image.datetime
+                        parsed_date = datetime.strptime(dt_str, '%Y:%m:%d %H:%M:%S')
+                        if is_valid_year(parsed_date.year):
                             metadata['datetime_original'] = parsed_date
                     except (ValueError, AttributeError):
                         pass
 
-                # Extract datetime
-                if hasattr(exif_image, 'datetime'):
-                    try:
-                        dt_str = exif_image.datetime
-                        parsed_date = datetime.strptime(dt_str, '%Y:%m:%d %H:%M:%S')
-                        # Filter: before 2004 or after 2026 -> discard
-                        if parsed_date >= MIN_DATE and parsed_date.year <= MAX_YEAR:
-                            if 'datetime_original' not in metadata:
-                                metadata['datetime_original'] = parsed_date
-                            else:
-                                metadata['datetime'] = parsed_date
-                    except (ValueError, AttributeError):
-                        pass
-
-                # Extract GPS coordinates
                 gps_coords = extract_gps_from_image(exif_image)
                 if gps_coords:
                     metadata['gps_coordinates'] = gps_coords
                 
-                # Extract make (manufacturer) field
                 if hasattr(exif_image, 'make'):
                     try:
                         make_value = exif_image.make
@@ -467,326 +626,199 @@ def extract_image_metadata(file_path: Path) -> Optional[Dict[str, Any]]:
                     except (ValueError, AttributeError):
                         pass
                     
-                # Если найдена валидная дата (после 2004 и до 2026), возвращаем метаданные
-                if 'datetime_original' in metadata or 'datetime' in metadata:
+                if 'datetime_original' in metadata:
                     return metadata
         except ValueError as e:
-            # TIFF byte order errors and similar - try hachoir as fallback
             error_str = str(e).lower()
             if 'tiff' in error_str or 'byte order' in error_str:
-                logger.info(f"TiffByteOrder error detected, trying hachoir: {file_path.name}")
+                logger.info(f"TiffByteOrder error, trying hachoir: {file_path.name}")
                 hachoir_metadata = extract_metadata_with_hachoir(file_path)
                 if hachoir_metadata:
                     return hachoir_metadata
-            # Log to file, not console
             _error_logger.error(f"EXIF extraction failed for {file_path}: {e}", exc_info=False)
         except Exception as e:
-            # Other exif errors - log to file
             _error_logger.error(f"EXIF extraction error for {file_path}: {e}", exc_info=False)
     
-    # Шаг 1.5: Try hachoir for HEIC/HEIF files or if file extension suggests video
-    suffix_lower = file_path.suffix.lower()
-    if suffix_lower in HACHOIR_FORMATS:
+    # Step 1.5: pymediainfo for MOV/MP4, hachoir for HEIC/HEIF
+    if suffix_lower in ('.mov', '.mp4', '.m4v'):
+        mediainfo_metadata = extract_metadata_with_pymediainfo(file_path)
+        if mediainfo_metadata:
+            return mediainfo_metadata
+    elif suffix_lower in ('.heic', '.heif'):
         hachoir_metadata = extract_metadata_with_hachoir(file_path)
         if hachoir_metadata:
             return hachoir_metadata
     
-    # Шаг 2: Fallback на Pillow (для PNG и других форматов)
+    # Step 2: Pillow fallback
     if not metadata and PILLOW_AVAILABLE:
         pillow_metadata = extract_image_metadata_with_pillow(file_path)
         if pillow_metadata:
-            # Filter dates from Pillow
-            filtered_metadata = {}
             for key, value in pillow_metadata.items():
                 if isinstance(value, datetime):
-                    if value >= MIN_DATE and value.year <= MAX_YEAR:
-                        filtered_metadata[key] = value
+                    if is_valid_year(value.year):
+                        metadata[key] = value
                 else:
-                    filtered_metadata[key] = value
-            if filtered_metadata:
-                metadata.update(filtered_metadata)
-                # Если найдена валидная дата, возвращаем метаданные
-                if 'datetime_original' in metadata or 'datetime' in metadata:
-                    return metadata
+                    metadata[key] = value
+            if 'datetime_original' in metadata or 'datetime' in metadata:
+                return metadata
     
-    # Шаг 3: XMP Brute Force (Deep Scan - Linux Style)
-    # This MUST take priority over system stats if it finds a valid date
-    xmp_date = get_xmp_brute_force_date(file_path)
-    if xmp_date:
-        metadata['datetime_original'] = xmp_date
-        return metadata
+    # Step 3: Filename parsing
+    if 'datetime_original' not in metadata and 'datetime' not in metadata:
+        filename_date = get_date_from_filename(file_path.name)
+        if filename_date:
+            metadata['datetime_original'] = filename_date
+            logger.info(f"Date found via: Filename - {filename_date} from {file_path.name}")
+            return metadata
     
-    # Шаг 4: Системные статистики (финальный fallback)
-    system_date = get_system_fallback_date(file_path)
-    if system_date:
-        metadata['datetime_original'] = system_date
-        return metadata
+    # Step 4: XMP Brute Force
+    if 'datetime_original' not in metadata:
+        xmp_date = get_xmp_brute_force_date(file_path)
+        if xmp_date:
+            metadata['datetime_original'] = xmp_date
+            return metadata
     
-    # iPhone Mode: Search for "Apple" in binary data if Make tag is missing
+    # Step 5: System stats (ONLY if valid year - NOT 2026)
+    if 'datetime_original' not in metadata:
+        system_date = get_system_fallback_date(file_path)
+        if system_date:
+            metadata['datetime_original'] = system_date
+            return metadata
+    
+    # Binary Apple check
     if 'make' not in metadata:
         try:
             with open(file_path, 'rb') as f:
-                # Read first 512KB to search for Apple identifier
                 data = f.read(524288)
                 if b'Apple' in data:
                     metadata['make'] = 'Apple'
-                    logger.debug(f"Found Apple identifier in binary data for {file_path.name}")
         except Exception:
             pass
     
-    # Если все методы извлечения не нашли валидную дату, возвращаем None
     return None
 
 
 def extract_video_metadata(file_path: Path) -> Optional[Dict[str, Any]]:
     """
-    Extract metadata from video file using mutagen with graceful handling.
+    Extract metadata from video file.
     
-    Краткое описание: Извлекает метаданные из видеофайла с помощью библиотеки mutagen,
-    включая дату создания и GPS-координаты (если доступны).
-    Проверяет creation_time в заголовках метаданных перед fallback на системные статистики.
-
-    Args:
-        file_path: Path to video file
-
-    Returns:
-        Dictionary with metadata or None if extraction fails or date is invalid
+    PRIMARY ENGINE: pymediainfo
+    CRITICAL TAG: comapplequicktimecreationdate
+    
+    If pymediainfo fails, falls back to binary regex search.
+    
+    STRICT: If year >= 2026, returns None to force Unknown_Year.
     """
-    # Динамический фильтр дат: защита от дат в будущем (2026+ если мы до 2026)
-    MAX_YEAR = get_max_valid_year()
-    
-    # Try hachoir first for MOV/MP4 files (before mutagen)
     suffix_lower = file_path.suffix.lower()
-    if suffix_lower in ('.mov', '.mp4', '.m4v') and HACHOIR_AVAILABLE:
-        hachoir_metadata = extract_metadata_with_hachoir(file_path)
-        if hachoir_metadata:
-            return hachoir_metadata
     
-    if not MUTAGEN_AVAILABLE:
-        # Попробовать бинарный поиск перед fallback на системные статистики
-        binary_date = get_video_binary_date(file_path)
-        if binary_date:
-            return {'datetime_original': binary_date}
-        # Fallback на системные статистики только если дата в допустимом диапазоне
-        system_date = get_system_fallback_date(file_path)
-        if system_date:
-            return {'datetime_original': system_date}
-        return None
-
-    try:
-        # Загрузка метаданных через mutagen
-        # Use pathlib Path object for Windows long path support
-        video_file = MutagenFile(str(file_path))
-        if not video_file:
-            logger.debug(f"Не удалось загрузить метаданные для {file_path.name}")
-            # Попробовать бинарный поиск перед fallback на системные статистики
-            binary_date = get_video_binary_date(file_path)
-            if binary_date:
-                return {'datetime_original': binary_date}
-            # Fallback на системные статистики только если дата в допустимом диапазоне
-            system_date = get_system_fallback_date(file_path)
-            if system_date:
-                return {'datetime_original': system_date}
-            return None
-
-        metadata = {}
-        
-        # Приоритетная проверка creation_time в заголовках метаданных
-        creation_time_keys = ['creation_time', 'creationdate', 'created', 'date_created']
-        for key in creation_time_keys:
-            if key in video_file:
-                try:
-                    date_str = str(video_file[key][0] if isinstance(video_file[key], list) else video_file[key])
-                    for fmt in ['%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M:%SZ', '%Y-%m-%d', '%Y:%m:%d %H:%M:%S', '%Y-%m-%d %H:%M:%S']:
-                        try:
-                            if fmt.endswith('Z'):
-                                date_str_clean = date_str.rstrip('Z')
-                                parsed_date = datetime.strptime(date_str_clean, fmt[:-1])
-                            else:
-                                parsed_date = datetime.strptime(date_str, fmt)
-                            # Фильтр: дата должна быть в диапазоне 2004-2026
-                            if parsed_date >= MIN_DATE and parsed_date.year <= MAX_YEAR:
-                                metadata['datetime_original'] = parsed_date
-                                break
-                        except ValueError:
-                            continue
-                    if 'datetime_original' in metadata:
-                        break
-                except (ValueError, IndexError, AttributeError, TypeError):
-                    continue
-
-        # Извлечение даты создания для MP4 файлов
-        if 'datetime_original' not in metadata and isinstance(video_file, MP4):
-            # MP4 использует ключи '©day' или '\xa9day' для даты создания
-            date_keys = ['©day', '\xa9day', '©DAY', '\xa9DAY']
-            for key in date_keys:
-                if key in video_file:
-                    try:
-                        date_str = str(video_file[key][0])
-                        # Формат обычно: "2023-12-25T10:30:00Z" или "2023-12-25"
-                        for fmt in ['%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M:%SZ', '%Y-%m-%d']:
-                            try:
-                                if fmt.endswith('Z'):
-                                    date_str_clean = date_str.rstrip('Z')
-                                    parsed_date = datetime.strptime(date_str_clean, fmt[:-1])
-                                else:
-                                    parsed_date = datetime.strptime(date_str, fmt)
-                                # Фильтр: дата должна быть в диапазоне 2004-2026
-                                if parsed_date >= MIN_DATE and parsed_date.year <= MAX_YEAR:
-                                    metadata['datetime_original'] = parsed_date
-                                    break
-                            except ValueError:
-                                continue
-                        if 'datetime_original' in metadata:
-                            break
-                    except (ValueError, IndexError, AttributeError) as e:
-                        logger.debug(f"Ошибка парсинга даты из {key}: {e}")
-
-        # Извлечение даты создания для QuickTime (MOV) файлов
-        if 'datetime_original' not in metadata and isinstance(video_file, QuickTime):
-            # QuickTime использует ключи '©day' или '\xa9day'
-            date_keys = ['©day', '\xa9day', '©DAY', '\xa9DAY']
-            for key in date_keys:
-                if key in video_file:
-                    try:
-                        date_str = str(video_file[key][0])
-                        for fmt in ['%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M:%SZ', '%Y-%m-%d']:
-                            try:
-                                if fmt.endswith('Z'):
-                                    date_str_clean = date_str.rstrip('Z')
-                                    parsed_date = datetime.strptime(date_str_clean, fmt[:-1])
-                                else:
-                                    parsed_date = datetime.strptime(date_str, fmt)
-                                # Фильтр: дата должна быть в диапазоне 2004-2026
-                                if parsed_date >= MIN_DATE and parsed_date.year <= MAX_YEAR:
-                                    metadata['datetime_original'] = parsed_date
-                                    break
-                            except ValueError:
-                                continue
-                        if 'datetime_original' in metadata:
-                            break
-                    except (ValueError, IndexError, AttributeError) as e:
-                        logger.debug(f"Ошибка парсинга даты из {key}: {e}")
-
-        # Для других форматов пытаемся найти общие ключи
-        if 'datetime_original' not in metadata:
-            # Попытка найти дату в общих тегах
-            common_date_keys = ['date', 'creation_date', '©day', '\xa9day']
-            for key in common_date_keys:
-                if key in video_file:
-                    try:
-                        date_str = str(video_file[key][0] if isinstance(video_file[key], list) else video_file[key])
-                        for fmt in ['%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M:%SZ', '%Y-%m-%d', '%Y:%m:%d %H:%M:%S']:
-                            try:
-                                if fmt.endswith('Z'):
-                                    date_str_clean = date_str.rstrip('Z')
-                                    parsed_date = datetime.strptime(date_str_clean, fmt[:-1])
-                                else:
-                                    parsed_date = datetime.strptime(date_str, fmt)
-                                # Фильтр: дата должна быть в диапазоне 2004-2026
-                                if parsed_date >= MIN_DATE and parsed_date.year <= MAX_YEAR:
-                                    metadata['datetime_original'] = parsed_date
-                                    break
-                            except ValueError:
-                                continue
-                        if 'datetime_original' in metadata:
-                            break
-                    except (ValueError, IndexError, AttributeError, TypeError) as e:
-                        logger.debug(f"Ошибка парсинга даты из {key}: {e}")
-
-        # Попытка извлечения GPS-координат (редко встречается в видео)
-        # MP4 может хранить GPS в ключах '©xyz' или '\xa9xyz'
-        gps_keys = ['©xyz', '\xa9xyz', 'location', 'gps']
-        for key in gps_keys:
-            if key in video_file:
-                try:
-                    gps_data = video_file[key][0] if isinstance(video_file[key], list) else video_file[key]
-                    # Формат может быть разным, пытаемся распарсить
-                    if isinstance(gps_data, str):
-                        # Может быть в формате "lat,lon" или "+lat+lon"
-                        parts = gps_data.replace('+', '').split(',')
-                        if len(parts) >= 2:
-                            try:
-                                lat = float(parts[0])
-                                lon = float(parts[1])
-                                metadata['gps_coordinates'] = (lat, lon)
-                                break
-                            except ValueError:
-                                pass
-                except (ValueError, IndexError, AttributeError, TypeError):
-                    pass
-        
-        # Extract make (manufacturer) from video metadata
-        # MP4/QuickTime may store make in '©mak' or '\xa9mak'
-        make_keys = ['©mak', '\xa9mak', '©MAK', '\xa9MAK', 'make', 'Make', 'manufacturer']
-        for key in make_keys:
-            if key in video_file:
-                try:
-                    make_value = video_file[key][0] if isinstance(video_file[key], list) else video_file[key]
-                    if make_value:
-                        metadata['make'] = str(make_value).strip()
-                        break
-                except (ValueError, IndexError, AttributeError, TypeError):
-                    pass
-
-        # Если не найдена дата в метаданных, попробовать бинарный поиск (ПЕРЕД системными статистиками)
-        if 'datetime_original' not in metadata:
-            binary_date = get_video_binary_date(file_path)
-            if binary_date:
-                metadata['datetime_original'] = binary_date
-        
-        # Если бинарный поиск не дал результата, fallback на системные статистики
-        if 'datetime_original' not in metadata:
-            system_date = get_system_fallback_date(file_path)
-            if system_date:
-                metadata['datetime_original'] = system_date
-        
-        if metadata:
-            return metadata
-        else:
-            return None
-
-    except Exception as e:
-        _error_logger.error(f"Video metadata extraction error for {file_path}: {e}", exc_info=False)
-        # Try hachoir as fallback for video files
-        if HACHOIR_AVAILABLE:
-            hachoir_metadata = extract_metadata_with_hachoir(file_path)
-            if hachoir_metadata:
+    # PRIMARY: pymediainfo for MOV/MP4 files
+    if suffix_lower in ('.mov', '.mp4', '.m4v'):
+        mediainfo_metadata = extract_metadata_with_pymediainfo(file_path)
+        if mediainfo_metadata and 'datetime_original' in mediainfo_metadata:
+            found_date = mediainfo_metadata['datetime_original']
+            if isinstance(found_date, datetime) and is_valid_year(found_date.year):
+                logger.info(f"Video metadata found! Year: {found_date.year} (via MediaInfo) from {file_path.name}")
+                return mediainfo_metadata
+    
+    # Hachoir for HEIC/HEIF files
+    if suffix_lower in ('.heic', '.heif') and HACHOIR_AVAILABLE:
+        hachoir_metadata = extract_metadata_with_hachoir(file_path)
+        if hachoir_metadata and 'datetime_original' in hachoir_metadata:
+            found_date = hachoir_metadata['datetime_original']
+            if isinstance(found_date, datetime) and is_valid_year(found_date.year):
+                logger.info(f"Video metadata found! Year: {found_date.year} (via Hachoir) from {file_path.name}")
                 return hachoir_metadata
-        # Попробовать бинарный поиск перед fallback на системные статистики
-        binary_date = get_video_binary_date(file_path)
-        if binary_date:
-            return {'datetime_original': binary_date}
-        # Fallback на системные статистики при ошибке, только если дата в допустимом диапазоне
-        system_date = get_system_fallback_date(file_path)
-        if system_date:
-            return {'datetime_original': system_date}
-        return None
+    
+    # Plan B: Binary regex for ISO pattern
+    if suffix_lower in ('.mov', '.mp4', '.m4v', '.heic', '.heif'):
+        iso_date = get_video_iso_binary_date(file_path)
+        if iso_date and is_valid_year(iso_date.year):
+            logger.info(f"Video metadata found! Year: {iso_date.year} (via ISO binary regex) from {file_path.name}")
+            return {'datetime_original': iso_date, 'make': 'Apple'}
+    
+    # Mutagen fallback
+    if MUTAGEN_AVAILABLE:
+        try:
+            video_file = MutagenFile(str(file_path))
+            if video_file:
+                metadata = {}
+                
+                # Check creation_time keys
+                creation_time_keys = ['creation_time', 'creationdate', 'created', 'date_created']
+                for key in creation_time_keys:
+                    if key in video_file:
+                        try:
+                            date_str = str(video_file[key][0] if isinstance(video_file[key], list) else video_file[key])
+                            for fmt in ['%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M:%SZ', '%Y-%m-%d', '%Y:%m:%d %H:%M:%S']:
+                                try:
+                                    date_str_clean = date_str.rstrip('Z')
+                                    parsed_date = datetime.strptime(date_str_clean, fmt.rstrip('Z'))
+                                    if is_valid_year(parsed_date.year):
+                                        metadata['datetime_original'] = parsed_date
+                                        logger.info(f"Date found via: Mutagen ({key}) - {parsed_date} from {file_path.name}")
+                                        break
+                                except ValueError:
+                                    continue
+                            if 'datetime_original' in metadata:
+                                break
+                        except (ValueError, IndexError, AttributeError, TypeError):
+                            continue
+
+                # MP4 date keys
+                if 'datetime_original' not in metadata and isinstance(video_file, MP4):
+                    date_keys = ['©day', '\xa9day']
+                    for key in date_keys:
+                        if key in video_file:
+                            try:
+                                date_str = str(video_file[key][0])
+                                for fmt in ['%Y-%m-%dT%H:%M:%S', '%Y-%m-%dT%H:%M:%SZ', '%Y-%m-%d']:
+                                    try:
+                                        date_str_clean = date_str.rstrip('Z')
+                                        parsed_date = datetime.strptime(date_str_clean, fmt.rstrip('Z'))
+                                        if is_valid_year(parsed_date.year):
+                                            metadata['datetime_original'] = parsed_date
+                                            break
+                                    except ValueError:
+                                        continue
+                                if 'datetime_original' in metadata:
+                                    break
+                            except (ValueError, IndexError, AttributeError):
+                                pass
+
+                if metadata:
+                    return metadata
+        except Exception as e:
+            _error_logger.error(f"Mutagen extraction error for {file_path}: {e}", exc_info=False)
+    
+    # Binary scan fallback
+    binary_date = get_video_binary_date(file_path)
+    if binary_date and is_valid_year(binary_date.year):
+        logger.info(f"Date found via: Video Binary Scan - {binary_date} from {file_path.name}")
+        return {'datetime_original': binary_date}
+    
+    # Filename parsing
+    filename_date = get_date_from_filename(file_path.name)
+    if filename_date:
+        logger.info(f"Date found via: Filename - {filename_date} from {file_path.name}")
+        return {'datetime_original': filename_date}
+    
+    # System stats - ONLY if valid year (NOT 2026)
+    system_date = get_system_fallback_date(file_path)
+    if system_date and is_valid_year(system_date.year):
+        logger.info(f"Date found via: System Stats - {system_date} from {file_path.name}")
+        return {'datetime_original': system_date}
+    
+    # No valid date found - return None to force Unknown_Year
+    logger.warning(f"No valid date (2004-2025) found for {file_path.name} - will use Unknown_Year")
+    return None
 
 
 def get_all_file_timestamps(file_path: Path) -> list[datetime]:
-    """
-    Получить все доступные временные метки файла из файловой системы.
-    
-    Краткое описание: Извлекает все доступные временные метки из файловой системы:
-    - st_ctime (время изменения статуса/создания)
-    - st_mtime (время модификации)
-    - st_birthtime (время создания, если доступно на системе)
-    
-    Args:
-        file_path: Path to file
-
-    Returns:
-        List of datetime objects (may be empty if stat fails)
-    """
+    """Get all available file timestamps from filesystem."""
     timestamps = []
     try:
         stat = file_path.stat()
-        # st_ctime - время последнего изменения статуса файла (на Linux это время создания inode)
         timestamps.append(datetime.fromtimestamp(stat.st_ctime))
-        # st_mtime - время последней модификации содержимого файла
         timestamps.append(datetime.fromtimestamp(stat.st_mtime))
-        # st_birthtime - время создания файла (доступно на macOS и некоторых Linux FS)
         if hasattr(stat, 'st_birthtime'):
             timestamps.append(datetime.fromtimestamp(stat.st_birthtime))
     except OSError as e:
@@ -797,42 +829,20 @@ def get_all_file_timestamps(file_path: Path) -> list[datetime]:
 
 def get_xmp_brute_force_date(file_path: Path) -> Optional[datetime]:
     """
-    Deep scan for XMP dates using brute force binary search (Linux Style).
-    
-    Opens file in binary mode, reads first 512KB, and searches for date patterns
-    using regex. This method finds hidden XMP dates that standard libraries miss.
-    Использует pathlib.Path объекты для кроссплатформенной совместимости.
-    
-    Args:
-        file_path: Path to image file (pathlib.Path object)
-        
-    Returns:
-        datetime object or None if no valid date found or date is outside valid range
+    Deep scan for XMP dates using brute force binary search.
     """
-    MAX_YEAR = get_max_valid_year()
-    
     try:
-        # Использование pathlib.Path объекта для открытия файла
         with open(file_path, 'rb') as f:
-            # Read first 512KB (524288 bytes)
             data = f.read(524288)
         
-        # Regex pattern for dates: YYYY:MM:DD or YYYY-MM-DD, with time
-        # Pattern: (\d{4}[:\-](\d{2})[:\-](\d{2})[ T](\d{2})[:](\d{2})[:](\d{2}))
         pattern = rb'(\d{4}[:\-](\d{2})[:\-](\d{2})[ T](\d{2})[:](\d{2})[:](\d{2}))'
-        
-        # Use search to find first match (findall returns tuples with groups)
         match = re.search(pattern, data)
         if not match:
             return None
         
-        # Extract the full match (group 0)
         date_str_bytes = match.group(0)
-        
-        # Convert bytes to string, handling both : and - separators
         date_str = date_str_bytes.decode('utf-8', errors='ignore')
         
-        # Try different formats
         formats = [
             '%Y:%m:%d %H:%M:%S',
             '%Y-%m-%d %H:%M:%S',
@@ -843,9 +853,8 @@ def get_xmp_brute_force_date(file_path: Path) -> Optional[datetime]:
         for fmt in formats:
             try:
                 parsed_date = datetime.strptime(date_str, fmt)
-                # Apply 2004-2026 year filter
-                if parsed_date >= MIN_DATE and parsed_date.year <= MAX_YEAR:
-                    logger.debug(f"XMP brute force found date: {parsed_date} in {file_path.name}")
+                if is_valid_year(parsed_date.year):
+                    logger.info(f"Date found via: XMP Brute Force - {parsed_date} from {file_path.name}")
                     return parsed_date
             except ValueError:
                 continue
@@ -856,95 +865,108 @@ def get_xmp_brute_force_date(file_path: Path) -> Optional[datetime]:
         return None
 
 
+def get_video_iso_binary_date(file_path: Path) -> Optional[datetime]:
+    """
+    Regex fallback: Search binary for ISO pattern YYYY-MM-DDTHH:MM:SS.
+    
+    Scans BOTH start and end of file (QuickTime moov atom can be at either location).
+    """
+    import os
+    
+    def find_date_in_data(data: bytes) -> Optional[datetime]:
+        pattern = rb'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})'
+        matches = re.findall(pattern, data)
+        
+        for match in matches:
+            date_str = match.decode('utf-8', errors='ignore')
+            date_str_clean = date_str[:19]  # YYYY-MM-DDTHH:MM:SS
+            
+            try:
+                parsed_date = datetime.strptime(date_str_clean, '%Y-%m-%dT%H:%M:%S')
+                if is_valid_year(parsed_date.year):
+                    return parsed_date
+            except ValueError:
+                continue
+        return None
+    
+    try:
+        file_size = os.path.getsize(str(file_path))
+        
+        # Read first 2MB
+        with open(file_path, 'rb') as f:
+            header_data = f.read(2 * 1024 * 1024)
+        
+        result = find_date_in_data(header_data)
+        if result:
+            logger.info(f"Date found via: ISO Binary Regex (header) - {result} from {file_path.name}")
+            return result
+        
+        # Read last 15MB (for large files with moov at end)
+        if file_size > 15 * 1024 * 1024:
+            with open(file_path, 'rb') as f:
+                f.seek(max(0, file_size - 15 * 1024 * 1024))
+                tail_data = f.read()
+            
+            result = find_date_in_data(tail_data)
+            if result:
+                logger.info(f"Date found via: ISO Binary Regex (tail) - {result} from {file_path.name}")
+                return result
+        
+        return None
+    except Exception as e:
+        logger.debug(f"ISO binary regex scan failed for {file_path}: {e}")
+        return None
+
+
 def get_video_binary_date(file_path: Path) -> Optional[datetime]:
     """
     Deep scan for video file dates using binary search.
     
-    Scans the first 1MB of video files (.MOV, .MP4) for date patterns in binary data.
-    Searches for ISO 8601 dates and standard date formats that may be embedded
-    in video metadata tags (mvhd, mdhd, cmeta, etc.).
-    Использует pathlib.Path объекты для кроссплатформенной совместимости.
-    
-    Args:
-        file_path: Path to video file (pathlib.Path object)
-        
-    Returns:
-        datetime object or None if no valid date found or date is outside 2004-2026 range
+    Scans BOTH start and end of file (QuickTime moov atom can be at either location).
     """
-    MAX_YEAR = get_max_valid_year()
+    import os
     
-    try:
-        # Log the deep scan attempt
-        logger.info(f"Deep scanning video file for hidden timestamps: {file_path.name}")
+    def find_date_in_data(data: bytes) -> Optional[datetime]:
+        # Pattern 1: Standard date format YYYY:MM:DD HH:MM:SS or YYYY-MM-DD HH:MM:SS
+        pattern1 = rb'(\d{4}[:\-]\d{2}[:\-]\d{2}[ T]\d{2}:\d{2}:\d{2})'
+        matches = re.findall(pattern1, data)
         
-        # Использование pathlib.Path объекта для открытия файла
-        with open(file_path, 'rb') as f:
-            # Read first 1MB (1048576 bytes) for video files
-            data = f.read(1048576)
+        formats = ['%Y:%m:%d %H:%M:%S', '%Y-%m-%d %H:%M:%S', '%Y:%m:%dT%H:%M:%S', '%Y-%m-%dT%H:%M:%S']
         
-        # Pattern 1: Standard date format (YYYY:MM:DD or YYYY-MM-DD with time)
-        pattern1 = rb'(\d{4}[:\-](\d{2})[:\-](\d{2})[ T](\d{2})[:](\d{2})[:](\d{2}))'
-        
-        # Pattern 2: ISO 8601 format (YYYY-MM-DDTHH:MM:SS) - often found in videos
-        pattern2 = rb'(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})'
-        
-        # Try Pattern 1 first (standard format)
-        match = re.search(pattern1, data)
-        if match:
-            date_str_bytes = match.group(0)
-            date_str = date_str_bytes.decode('utf-8', errors='ignore')
-            
-            formats = [
-                '%Y:%m:%d %H:%M:%S',
-                '%Y-%m-%d %H:%M:%S',
-                '%Y:%m:%dT%H:%M:%S',
-                '%Y-%m-%dT%H:%M:%S'
-            ]
-            
+        for match in matches:
+            date_str = match.decode('utf-8', errors='ignore')
             for fmt in formats:
                 try:
                     parsed_date = datetime.strptime(date_str, fmt)
-                    # Apply 2004-2026 year filter
-                    if parsed_date >= MIN_DATE and parsed_date.year <= MAX_YEAR:
-                        logger.debug(f"Video binary scan (pattern1) found date: {parsed_date} in {file_path.name}")
+                    if is_valid_year(parsed_date.year):
                         return parsed_date
                 except ValueError:
                     continue
+        return None
+    
+    try:
+        logger.info(f"Deep scanning video file for hidden timestamps: {file_path.name}")
+        file_size = os.path.getsize(str(file_path))
         
-        # Try Pattern 2 (ISO 8601)
-        match = re.search(pattern2, data)
-        if match:
-            date_str_bytes = match.group(0)
-            date_str = date_str_bytes.decode('utf-8', errors='ignore')
+        # Read first 2MB
+        with open(file_path, 'rb') as f:
+            header_data = f.read(2 * 1024 * 1024)
+        
+        result = find_date_in_data(header_data)
+        if result:
+            logger.info(f"Date found via: Video Binary Scan (header) - {result} from {file_path.name}")
+            return result
+        
+        # Read last 15MB
+        if file_size > 15 * 1024 * 1024:
+            with open(file_path, 'rb') as f:
+                f.seek(max(0, file_size - 15 * 1024 * 1024))
+                tail_data = f.read()
             
-            # Clean up the date string - remove timezone info if present
-            # ISO 8601: YYYY-MM-DDTHH:MM:SS or YYYY-MM-DDTHH:MM:SSZ
-            # Remove Z suffix and any timezone offset
-            date_str_clean = date_str.rstrip('Z')
-            # Remove timezone offset if present (e.g., +00:00, -05:00)
-            if '+' in date_str_clean:
-                date_str_clean = date_str_clean.split('+')[0]
-            elif date_str_clean.count('-') > 2:  # Has timezone offset like -05:00
-                # Find the T separator and take everything before the last timezone part
-                if 'T' in date_str_clean:
-                    parts = date_str_clean.split('T')
-                    if len(parts) == 2:
-                        time_part = parts[1]
-                        # Remove timezone offset (format: HH:MM:SS-XX:XX)
-                        if '-' in time_part and time_part.count(':') > 2:
-                            time_part = ':'.join(time_part.split(':')[:3])  # Take first 3 parts (HH:MM:SS)
-                        date_str_clean = f"{parts[0]}T{time_part}"
-            
-            # Try parsing the cleaned ISO 8601 format
-            if len(date_str_clean) == 19:  # YYYY-MM-DDTHH:MM:SS
-                try:
-                    parsed_date = datetime.strptime(date_str_clean, '%Y-%m-%dT%H:%M:%S')
-                    # Apply 2004-2026 year filter
-                    if parsed_date >= MIN_DATE and parsed_date.year <= MAX_YEAR:
-                        logger.debug(f"Video binary scan (pattern2 ISO 8601) found date: {parsed_date} in {file_path.name}")
-                        return parsed_date
-                except ValueError:
-                    pass
+            result = find_date_in_data(tail_data)
+            if result:
+                logger.info(f"Date found via: Video Binary Scan (tail) - {result} from {file_path.name}")
+                return result
         
         return None
     except Exception as e:
@@ -956,26 +978,19 @@ def get_system_fallback_date(file_path: Path) -> Optional[datetime]:
     """
     Get system fallback date using only os.path.getmtime and os.path.getctime.
     
-    Args:
-        file_path: Path to file
-        
-    Returns:
-        datetime object or None if date is before 2004 or after 2026, or extraction fails
+    STRICT: If year >= 2026, returns None (not valid).
     """
-    # Динамический фильтр дат: защита от дат в будущем (2026+ если мы до 2026)
-    MAX_YEAR = get_max_valid_year()
-    
     try:
-        # Use pathlib Path object for Windows long path support
         mtime = os.path.getmtime(str(file_path))
         ctime = os.path.getctime(str(file_path))
         system_date = datetime.fromtimestamp(min(mtime, ctime))
         
-        # Filter: before 2004 or after MAX_YEAR -> return None
-        if system_date < MIN_DATE or system_date.year > MAX_YEAR:
+        # STRICT: Only return if year is valid (2004-2025)
+        if is_valid_year(system_date.year):
+            return system_date
+        else:
+            logger.debug(f"System date rejected (year {system_date.year} not in 2004-2025): {file_path.name}")
             return None
-            
-        return system_date
     except (OSError, ValueError) as e:
         logger.debug(f"System fallback date extraction failed for {file_path}: {e}")
         return None
@@ -984,28 +999,7 @@ def get_system_fallback_date(file_path: Path) -> Optional[datetime]:
 def get_file_creation_time(file_path: Path) -> Optional[datetime]:
     """
     Get file creation time with updated extraction hierarchy.
-    
-    Extraction priority:
-    1. Standard EXIF (for JPGs)
-    2. Pillow Info (for PNG/General)
-    3. XMP Brute Force (Deep Scan - Linux Style)
-    4. System Fallback (min of ctime/mtime) - only as last resort
-    
-    All dates are filtered: before 2004 or after 2026 -> None.
-    Обновлен фильтр дат: теперь разрешен 2026 год для актуальных файлов.
-    
-    IMPORTANT: If XMP scan finds 2021 and system stats say 2026, XMP date MUST win.
-
-    Args:
-        file_path: Path to file
-
-    Returns:
-        datetime object or None if date is invalid or extraction fails
     """
-    # Динамический фильтр дат: защита от дат в будущем (2026+ если мы до 2026)
-    MAX_YEAR = get_max_valid_year()
-    
-    # Priority 1: Standard EXIF extraction (for JPGs, not PNG)
     suffix_lower = file_path.suffix.lower()
     skip_exif = (suffix_lower == '.png')
     
@@ -1015,34 +1009,29 @@ def get_file_creation_time(file_path: Path) -> Optional[datetime]:
                 exif_image = ExifImage(image_file)
             
             if exif_image.has_exif:
-                # Try datetime_original
                 if hasattr(exif_image, 'datetime_original'):
                     try:
                         dt_str = exif_image.datetime_original
                         parsed_date = datetime.strptime(dt_str, '%Y:%m:%d %H:%M:%S')
-                        if parsed_date >= MIN_DATE and parsed_date.year <= MAX_YEAR:
+                        if is_valid_year(parsed_date.year):
                             return parsed_date
                     except (ValueError, AttributeError):
                         pass
                 
-                # Try datetime
                 if hasattr(exif_image, 'datetime'):
                     try:
                         dt_str = exif_image.datetime
                         parsed_date = datetime.strptime(dt_str, '%Y:%m:%d %H:%M:%S')
-                        if parsed_date >= MIN_DATE and parsed_date.year <= MAX_YEAR:
+                        if is_valid_year(parsed_date.year):
                             return parsed_date
                     except (ValueError, AttributeError):
                         pass
         except (ValueError, Exception):
-            # EXIF errors are logged silently
             pass
     
-    # Priority 2: Pillow Info (for PNG/General)
     if PILLOW_AVAILABLE:
         try:
             with PILImage.open(file_path) as img:
-                # Check img.info
                 if hasattr(img, 'info') and img.info:
                     for key, value in img.info.items():
                         if isinstance(key, str) and isinstance(value, str):
@@ -1051,12 +1040,11 @@ def get_file_creation_time(file_path: Path) -> Optional[datetime]:
                                 for fmt in ['%Y:%m:%d %H:%M:%S', '%Y-%m-%d %H:%M:%S', '%Y-%m-%dT%H:%M:%S', '%Y-%m-%d']:
                                     try:
                                         parsed_date = datetime.strptime(str(value), fmt)
-                                        if parsed_date >= MIN_DATE and parsed_date.year <= MAX_YEAR:
+                                        if is_valid_year(parsed_date.year):
                                             return parsed_date
                                     except ValueError:
                                         continue
                 
-                # Check getexif()
                 try:
                     exifdata = img.getexif()
                     if exifdata:
@@ -1065,7 +1053,7 @@ def get_file_creation_time(file_path: Path) -> Optional[datetime]:
                             if tag == 'DateTimeOriginal' and value:
                                 try:
                                     parsed_date = datetime.strptime(str(value), '%Y:%m:%d %H:%M:%S')
-                                    if parsed_date >= MIN_DATE and parsed_date.year <= MAX_YEAR:
+                                    if is_valid_year(parsed_date.year):
                                         return parsed_date
                                 except (ValueError, TypeError):
                                     pass
@@ -1074,52 +1062,24 @@ def get_file_creation_time(file_path: Path) -> Optional[datetime]:
         except Exception:
             pass
     
-    # Priority 3: XMP Brute Force (Deep Scan - Linux Style)
-    # This MUST take priority over system stats if it finds a valid date
     xmp_date = get_xmp_brute_force_date(file_path)
     if xmp_date:
         return xmp_date
     
-    # Priority 4: System Fallback (only as last resort)
     return get_system_fallback_date(file_path)
 
 
 def get_best_timestamp(file_path: Path, metadata: Optional[Dict[str, Any]] = None) -> Optional[datetime]:
     """
-    Получить лучшую (самую раннюю) временную метку из всех доступных источников.
+    Get best (earliest) timestamp from all available sources.
     
-    Проверка на 2004 год и уход от использования текущей даты.
-    
-    Краткое описание: Собирает все доступные даты из метаданных (EXIF для фото,
-    заголовки медиа для видео) и файловой системы, фильтрует их по порогу 2004 года
-    (чтобы отсечь системные значения по умолчанию типа 1970 или 1900) и возвращает
-    самую раннюю валидную дату.
-    
-    Порог 2004 года выбран для фильтрации "мусорных" дат, которые могут появиться
-    при сбое часов камеры или системных настройках по умолчанию.
-    Обновлен фильтр дат: теперь разрешен 2026 год для актуальных файлов.
-    
-    ВАЖНО: НЕ использует datetime.now() или текущий год как fallback.
-    Если не найдено валидной даты, возвращает None.
-
-    Args:
-        file_path: Путь к медиафайлу
-        metadata: Опциональный словарь метаданных (если None, будет извлечен автоматически)
-
-    Returns:
-        datetime объект с самой ранней валидной датой или None, если не найдено ни одной
-        валидной даты после 2004-01-01
+    STRICT: Only accepts years 2004-2025. Returns None for invalid years.
     """
     file_path = Path(file_path)
     suffix_lower = file_path.suffix.lower()
     
-    # Порог 2004-01-01 для фильтрации системных значений по умолчанию
-    # Динамический фильтр дат: защита от дат в будущем (2026+ если мы до 2026)
-    MAX_YEAR = get_max_valid_year()
-    
     all_dates = []
     
-    # Извлечение метаданных, если не предоставлены
     if metadata is None:
         if suffix_lower in IMAGE_EXTENSIONS:
             metadata = extract_image_metadata(file_path) or {}
@@ -1128,36 +1088,24 @@ def get_best_timestamp(file_path: Path, metadata: Optional[Dict[str, Any]] = Non
         else:
             metadata = {}
     
-    # Сбор всех дат из метаданных
     if 'datetime_original' in metadata and isinstance(metadata['datetime_original'], datetime):
         all_dates.append(metadata['datetime_original'])
     if 'datetime' in metadata and isinstance(metadata['datetime'], datetime):
         all_dates.append(metadata['datetime'])
     
-    # Добавление системных временных меток (используем минимальное из getmtime и getctime)
     system_date = get_system_fallback_date(file_path)
     if system_date:
         all_dates.append(system_date)
     
-    # Фильтрация: только даты после 2004-01-01 и до 2026 года включительно
-    valid_dates = [
-        dt for dt in all_dates 
-        if dt is not None and isinstance(dt, datetime) and dt >= MIN_DATE and dt.year <= MAX_YEAR
-    ]
+    # STRICT filter: only 2004-2025
+    valid_dates = [dt for dt in all_dates if dt and is_valid_year(dt.year)]
     
-    # Возврат самой ранней даты или None (НЕ используем datetime.now())
     if valid_dates:
         best_date = min(valid_dates)
-        logger.debug(
-            f"Найдена лучшая дата для {file_path.name}: {best_date.strftime('%Y-%m-%d %H:%M:%S')} "
-            f"(отфильтровано {len(valid_dates)} из {len(all_dates)} временных меток)"
-        )
+        logger.debug(f"Best date for {file_path.name}: {best_date.strftime('%Y-%m-%d %H:%M:%S')}")
         return best_date
     else:
-        logger.warning(
-            f"Не найдено валидных дат после 2004-01-01 для {file_path.name} "
-            f"(найдено {len(all_dates)} временных меток, все отфильтрованы)"
-        )
+        logger.warning(f"No valid dates (2004-2025) found for {file_path.name}")
         return None
 
 
@@ -1165,46 +1113,28 @@ def extract_metadata(file_path: Path) -> Dict[str, Any]:
     """
     Extract metadata from media file (image or video) with oldest date strategy.
     
-    Краткое описание: Извлекает метаданные из медиафайла (изображение или видео).
-    Использует функцию get_best_timestamp для выбора самой ранней валидной даты
-    с фильтрацией по порогу 2004 года. Все ошибки обрабатываются тихо, без вывода в консоль.
-
-    Args:
-        file_path: Path to media file
-
-    Returns:
-        Dictionary with metadata including datetime_original (best date found, or None)
+    Returns dictionary with metadata. If no valid date found, datetime_original
+    will be None or missing, which will cause the file to go to Unknown_Year.
     """
     file_path = Path(file_path)
     suffix_lower = file_path.suffix.lower()
 
     metadata = {}
 
-    # Извлечение метаданных в зависимости от типа файла
-    # Все ошибки обрабатываются внутри функций и логируются в файл
     try:
         if suffix_lower in IMAGE_EXTENSIONS:
             metadata = extract_image_metadata(file_path) or {}
         elif suffix_lower in VIDEO_EXTENSIONS:
             metadata = extract_video_metadata(file_path) or {}
     except Exception as e:
-        # Дополнительная защита - любые неожиданные ошибки логируются в файл
         _error_logger.error(f"Metadata extraction failed for {file_path}: {e}", exc_info=False)
         metadata = {}
 
-    # Использование get_best_timestamp для выбора лучшей даты
-    # (собирает все даты из метаданных и файловой системы, фильтрует по 2004 году)
-    # Если метаданные не извлечены, get_best_timestamp использует st_ctime как fallback
     try:
         best_timestamp = get_best_timestamp(file_path, metadata)
         if best_timestamp:
             metadata['datetime_original'] = best_timestamp
     except Exception as e:
-        # Ошибки в get_best_timestamp также логируются тихо
         _error_logger.error(f"get_best_timestamp failed for {file_path}: {e}", exc_info=False)
-    
-    # Если best_timestamp == None, не устанавливаем datetime_original
-    # Это позволит generate_target_path использовать fallback на "Unknown_Year"
 
     return metadata
-
