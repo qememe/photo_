@@ -51,6 +51,13 @@ if errorlevel 1 (
     exit /b 1
 )
 
+REM Explicitly install hachoir for video metadata extraction
+echo Installing hachoir for video metadata support...
+pip install --no-cache-dir --upgrade hachoir
+if errorlevel 1 (
+    echo Warning: Failed to install hachoir. Video metadata extraction may be limited.
+)
+
 echo.
 echo ==========================================
 echo Installation complete!

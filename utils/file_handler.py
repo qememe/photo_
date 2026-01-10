@@ -175,21 +175,20 @@ def get_unique_filename(target_dir: Path, filename: str, source_file: Optional[P
 
 def move_file(media_file: MediaFile, verify_location: bool = True) -> Tuple[bool, bool]:
     """
-    Move file from source to target location using safe copy+verify+delete pattern.
+    Move file from source to target location using fast shutil.move.
     
-    Краткое описание: Безопасно перемещает файл из исходного местоположения в целевое
-    используя паттерн копирование+проверка+удаление. НИКОГДА не перезаписывает существующие файлы.
-    Если файл с таким именем уже существует и идентичен (по размеру), пропускает перемещение.
+    Краткое описание: Быстро перемещает файл из исходного местоположения в целевое
+    используя shutil.move (мгновенно на одном диске). НИКОГДА не перезаписывает существующие файлы.
+    Если файл с таким именем уже существует и идентичен (по размеру), удаляет исходный файл (дубликат).
     Если файл существует но отличается, переименовывает новый файл с суффиксом _copy_N.
     
-    ВАЖНО: Операция строго СИНХРОННАЯ. Используется shutil.copy2() для копирования,
-    затем проверка существования целевого файла, и только после успешной проверки
-    удаляется исходный файл. Никаких потоков, процессов или асинхронных операций не используется.
+    ВАЖНО: Операция строго СИНХРОННАЯ. Используется shutil.move() для мгновенного перемещения
+    на одном диске. Никаких потоков, процессов или асинхронных операций не используется.
     
     КРИТИЧНО: 
-    - Директория создается ПЕРЕД копированием файла для предотвращения WinError 3
+    - Директория создается ПЕРЕД перемещением файла для предотвращения WinError 3
     - Режим APPEND: существующие файлы и папки остаются нетронутыми
-    - Удаление исходного файла происходит ТОЛЬКО после успешного копирования и проверки
+    - Если целевой файл существует и размеры совпадают, исходный файл удаляется (дубликат)
 
     Args:
         media_file: MediaFile instance to move
@@ -215,46 +214,35 @@ def move_file(media_file: MediaFile, verify_location: bool = True) -> Tuple[bool
             # Если папка уже существует, просто используем её (режим APPEND)
             media_file.target_path.parent.mkdir(parents=True, exist_ok=True)
 
-            # СИНХРОННАЯ проверка и обеспечение уникальности имени файла ПЕРЕД копированием
-            # Функция get_unique_filename проверяет существование файла, сравнивает размеры
-            # и возвращает флаг skip=True если файл идентичен
-            unique_path, should_skip = get_unique_filename(
-                media_file.target_path.parent, 
-                media_file.target_path.name,
-                source_file=media_file.source_path
-            )
-            
-            # Если файл уже существует и идентичен, пропускаем перемещение
-            if should_skip:
-                logger.info(f"Файл уже существует (идентичен), пропускаем: {media_file.source_path.name}")
-                return (True, True)
-            
-            # Обновляем целевой путь на уникальное имя (если было переименование)
-            media_file.target_path = unique_path
+            # Проверка существования целевого файла
+            if media_file.target_path.exists():
+                # Если файл существует, проверяем размеры
+                source_size = media_file.source_path.stat().st_size
+                target_size = media_file.target_path.stat().st_size
+                
+                if source_size == target_size:
+                    # Файлы идентичны - удаляем исходный (дубликат)
+                    logger.info(f"Файл уже существует (идентичен), удаляем дубликат: {media_file.source_path.name}")
+                    media_file.source_path.unlink()
+                    return (True, True)
+                else:
+                    # Файлы разные - нужно переименовать
+                    unique_path, should_skip = get_unique_filename(
+                        media_file.target_path.parent, 
+                        media_file.target_path.name,
+                        source_file=media_file.source_path
+                    )
+                    media_file.target_path = unique_path
+                    if should_skip:
+                        logger.info(f"Файл уже существует (идентичен), пропускаем: {media_file.source_path.name}")
+                        return (True, True)
+            else:
+                # Целевой файл не существует - используем исходный путь
+                pass
 
-            # БЕЗОПАСНОЕ КОПИРОВАНИЕ: используем shutil.copy2() для сохранения метаданных
-            # Это НЕ перезаписывает существующие файлы (get_unique_filename уже проверил)
-            shutil.copy2(media_file.source_path, media_file.target_path)
-            
-            # КРИТИЧНО: Проверка существования целевого файла после копирования
-            if not media_file.target_path.exists():
-                logger.error(f"Целевой файл не найден после копирования: {media_file.target_path}")
-                return (False, False)
-            
-            # Проверка размера для дополнительной безопасности
-            source_size = media_file.source_path.stat().st_size
-            target_size = media_file.target_path.stat().st_size
-            if source_size != target_size:
-                logger.error(f"Размеры файлов не совпадают после копирования: {source_size} != {target_size}")
-                # Удаляем неполный целевой файл
-                try:
-                    media_file.target_path.unlink()
-                except OSError:
-                    pass
-                return (False, False)
-            
-            # ТОЛЬКО ПОСЛЕ УСПЕШНОГО КОПИРОВАНИЯ И ПРОВЕРКИ: удаляем исходный файл
-            media_file.source_path.unlink()
+            # БЫСТРОЕ ПЕРЕМЕЩЕНИЕ: используем shutil.move() для мгновенного перемещения на одном диске
+            # Это НЕ перезаписывает существующие файлы (проверка выше уже выполнена)
+            shutil.move(str(media_file.source_path), str(media_file.target_path))
             
             logger.info(f"Перемещено: {media_file.source_path} -> {media_file.target_path}")
             return (True, False)
